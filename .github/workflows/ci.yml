@@ -9,9 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   verify:
     name: Node ${{ matrix.node }}
@@ -37,8 +34,8 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5544/mastra_pubsub
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -72,8 +69,8 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5544/mastra_pubsub
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24.x
           cache: npm
