@@ -61,7 +61,7 @@ get them through replay.
 
 ### subscribe
 
-- `options.group` set → shared subscription row `id = group`; every group member claims
+- `options.group` set → shared subscription row derived from `(topic, group)`; every group member on that topic claims
   from the same delivery rows, so each event reaches exactly one member
   (`FOR UPDATE SKIP LOCKED`). Multiple local callbacks on the same group round-robin.
 - No group → private subscription row (`__private:<instanceId>:<uuid>`); each callback
@@ -78,8 +78,8 @@ get them through replay.
 - A dedicated `LISTEN` connection wakes the loops for a topic the moment something is
   published; `pollIntervalMs` polling is the backstop that also picks up visibility-timeout
   redeliveries. `listen: false` degrades to pure polling.
-- `flush()` resolves when all in-flight publishes and callback deliveries settle. Callback
-  errors are logged, never thrown.
+- `flush()` resolves when all in-flight publishes and locally-owned deliveries settle. Callback
+  errors are logged, never thrown; unsettled deliveries after the bounded drain window make `flush()` reject instead of reporting a clean drain.
 - `close()` stops loops, releases the listener, deletes private subscriptions, ends the
   pool (only if the library created it).
 - Periodic maintenance (every `cleanupIntervalMs`): trim each topic to `maxEventsPerTopic`
@@ -90,8 +90,8 @@ get them through replay.
 ### Replay
 
 - `getHistory(topic, offset = 0)` → `SELECT ... WHERE topic = $1 AND index >= $2 ORDER BY index`.
-- `subscribeWithReplay` / `subscribeFromOffset`: register the live subscription first (so
-  nothing is missed), then deliver history, deduping the boundary by event `index`.
+- `subscribeWithReplay` / `subscribeFromOffset`: create the live subscription row first (so
+  nothing is missed), replay history while the consume loop is paused, settle replayed delivery rows, then start live delivery; setup failures clean up the paused subscription.
 
 ## Configuration
 
@@ -134,6 +134,6 @@ Defaults mirror `@mastra/redis-streams` where a counterpart exists
   `.ts` relative imports with `rewriteRelativeImportExtensions` for the build).
 - ESM-only. Tests with `node:test`; coverage with the built-in coverage reporter,
   enforced thresholds. Build = `tsc` to `dist/` (the only transpile step).
-- Lint/format: Biome. Postgres for dev/test via `docker compose` (latest image).
+- Lint/format: Biome. Postgres for dev/test via `docker compose` (pinned major image).
 - E2E: real Mastra instance + real OpenAI agent (`OPENAI_API_KEY` from `.env`) proving
   cross-instance delivery, semantics, and replay against a live database.

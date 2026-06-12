@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Event, EventCallback, SubscribeOptions } from '@mastra/core/events';
 import { PubSub } from '@mastra/core/events';
 import pg from 'pg';
@@ -16,6 +16,7 @@ interface Subscription {
   readonly isGroup: boolean;
   readonly registry: CallbackRegistry;
   readonly loop: ConsumeLoop;
+  started: boolean;
   unregisterWake: (() => void) | undefined;
 }
 
@@ -33,6 +34,18 @@ interface EventRow {
   run_id: string;
   data: unknown;
   created_at: Date;
+}
+
+function mapKey(topic: string, subscriptionId: string): string {
+  return JSON.stringify([topic, subscriptionId]);
+}
+
+function hashPart(value: string): string {
+  return createHash('sha256').update(value).digest('base64url');
+}
+
+function groupSubscriptionId(topic: string, group: string): string {
+  return `__group:${hashPart(topic)}:${hashPart(group)}`;
 }
 
 function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
@@ -247,10 +260,13 @@ export class PostgresPubSub extends PubSub {
     userKey: EventCallback,
     registered: EventCallback,
     group: string | undefined,
-  ): Promise<void> {
+    startImmediately = true,
+  ): Promise<Subscription> {
     await this.#ensureReady();
-    const subscriptionId = group ?? `__private:${this.#instanceId}:${randomUUID()}`;
-    const key = `${topic} ${subscriptionId}`;
+    const subscriptionId = group
+      ? groupSubscriptionId(topic, group)
+      : `__private:${this.#instanceId}:${randomUUID()}`;
+    const key = mapKey(topic, subscriptionId);
 
     let sub = this.#subscriptions.get(key);
     if (!sub) {
@@ -266,12 +282,16 @@ export class PostgresPubSub extends PubSub {
         isGroup,
         registry,
       );
-      sub = { id: subscriptionId, topic, isGroup, registry, loop, unregisterWake: undefined };
+      sub = {
+        id: subscriptionId,
+        topic,
+        isGroup,
+        registry,
+        loop,
+        started: false,
+        unregisterWake: undefined,
+      };
       this.#subscriptions.set(key, sub);
-      loop.start();
-      if (this.#config.listen) {
-        await this.#registerWake(sub);
-      }
     }
 
     sub.registry.callbacks.push(registered);
@@ -281,7 +301,22 @@ export class PostgresPubSub extends PubSub {
       this.#cbIndex.set(userKey, registrations);
     }
     registrations.push({ sub, registered });
-    sub.loop.wake();
+    if (startImmediately) {
+      await this.#startSubscription(sub);
+      sub.loop.wake();
+    }
+    return sub;
+  }
+
+  async #startSubscription(sub: Subscription): Promise<void> {
+    if (sub.started) {
+      return;
+    }
+    sub.loop.start();
+    sub.started = true;
+    if (this.#config.listen) {
+      await this.#registerWake(sub);
+    }
   }
 
   async #registerWake(sub: Subscription): Promise<void> {
@@ -335,7 +370,7 @@ export class PostgresPubSub extends PubSub {
   }
 
   async #teardownSubscription(sub: Subscription): Promise<void> {
-    const key = `${sub.topic} ${sub.id}`;
+    const key = mapKey(sub.topic, sub.id);
     this.#subscriptions.delete(key);
     sub.unregisterWake?.();
     await sub.loop.stop();
@@ -347,21 +382,23 @@ export class PostgresPubSub extends PubSub {
   }
 
   /**
-   * Resolve once all in-flight publishes and claimable deliveries have settled.
-   * Per-event callback errors are logged, never thrown.
+   * Resolve once all in-flight publishes and local deliveries have settled.
+   * Per-event callback errors are logged, never thrown. If locally-owned
+   * deliveries remain unsettled after the bounded drain window, reject so
+   * shutdown callers do not mistake a stuck subscriber for a clean drain.
    */
   override async flush(): Promise<void> {
     await Promise.allSettled([...this.#pendingPublishes]);
-    let pass = 0;
-    while (pass < 50) {
+    let pending = 0;
+    for (let pass = 0; pass < 50; pass++) {
       await Promise.all([...this.#subscriptions.values()].map((s) => s.loop.drain()));
-      const pending = await this.#countPending();
+      pending = await this.#countPending();
       if (pending === 0) {
         return;
       }
-      pass++;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    throw new Error(`PostgresPubSub flush timed out with ${pending} unsettled deliveries`);
   }
 
   async #countPending(): Promise<number> {
@@ -371,7 +408,7 @@ export class PostgresPubSub extends PubSub {
     }
     const result = await this.#pool.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM ${this.#q('deliveries')}
-       WHERE subscription_id = ANY($1::text[]) AND visible_at <= now()`,
+       WHERE subscription_id = ANY($1::text[])`,
       [ids],
     );
     return Number(result.rows[0]?.count ?? '0');
@@ -430,18 +467,61 @@ export class PostgresPubSub extends PubSub {
       return cb(event, ack, nack);
     };
 
-    // Register live first (keyed by the user's cb for unsubscribe), so no
-    // event published during replay is missed.
-    await this.#subscribeInternal(topic, cb, wrapped, undefined);
-    live = true;
+    // Create the live subscription row first so events published during replay
+    // get delivery rows, but keep the consume loop paused until historical
+    // callbacks run in order. Replayed deliveries are then settled for this
+    // private subscription to avoid duplicate live delivery at the boundary.
+    const sub = await this.#subscribeInternal(topic, cb, wrapped, undefined, false);
 
-    const history = await this.getHistory(topic, offset);
-    for (const event of history) {
-      if (event.index !== undefined && seen.has(event.index)) {
-        continue;
+    try {
+      const replayedIndexes: number[] = [];
+      const history = await this.getHistory(topic, offset);
+      for (const event of history) {
+        if (event.index !== undefined && seen.has(event.index)) {
+          continue;
+        }
+        try {
+          await cb(event);
+          if (event.index !== undefined) {
+            replayedIndexes.push(event.index);
+          }
+        } catch (error) {
+          this.#logger.error?.('replay callback threw', error);
+        }
       }
-      cb(event);
+      await this.#ackReplayedDeliveries(topic, sub.id, replayedIndexes);
+
+      live = true;
+      await this.#startSubscription(sub);
+      sub.loop.wake();
+    } catch (error) {
+      await this.unsubscribe(topic, cb).catch((teardownError) => {
+        this.#logger.warn?.(
+          'failed to clean up replay subscription after setup failure',
+          teardownError,
+        );
+      });
+      throw error;
     }
+  }
+
+  async #ackReplayedDeliveries(
+    topic: string,
+    subscriptionId: string,
+    indexes: number[],
+  ): Promise<void> {
+    if (indexes.length === 0) {
+      return;
+    }
+    await this.#pool.query(
+      `DELETE FROM ${this.#q('deliveries')} d
+       USING ${this.#q('events')} e
+       WHERE d.event_seq = e.seq
+         AND d.subscription_id = $1
+         AND e.topic = $2
+         AND e.index = ANY($3::bigint[])`,
+      [subscriptionId, topic, indexes],
+    );
   }
 
   #startMaintenance(): void {

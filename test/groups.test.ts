@@ -126,6 +126,39 @@ test('two private subscribes (no group) each get every event', async () => {
   assert.deepEqual(idx2, [0, 1, 2]);
 });
 
+test('same group name can subscribe to different topics independently', async () => {
+  const ps = makePubSub(schema);
+  pubsubs.push(ps);
+
+  const topicA: number[] = [];
+  const topicB: number[] = [];
+
+  await ps.subscribe(
+    'topic-shared-group-a',
+    (event, ack) => {
+      if (event.index !== undefined) topicA.push(event.index);
+      ack?.();
+    },
+    { group: 'same-logical-group' },
+  );
+  await ps.subscribe(
+    'topic-shared-group-b',
+    (event, ack) => {
+      if (event.index !== undefined) topicB.push(event.index);
+      ack?.();
+    },
+    { group: 'same-logical-group' },
+  );
+
+  await ps.publish('topic-shared-group-a', { type: 'a', data: null, runId: 'ra' });
+  await ps.publish('topic-shared-group-b', { type: 'b', data: null, runId: 'rb' });
+
+  await waitFor(() => topicA.length === 1 && topicB.length === 1, { timeoutMs: 5_000 });
+
+  assert.deepEqual(topicA, [0]);
+  assert.deepEqual(topicB, [0]);
+});
+
 test('group subscription persists across instances: only one receives per event', async () => {
   const psA = makePubSub(schema);
   pubsubs.push(psA);

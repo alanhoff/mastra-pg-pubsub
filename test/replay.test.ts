@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import type { Event } from '@mastra/core/events';
-import { dropSchema, makePubSub, uniqueSchema, waitFor } from './helpers.ts';
+import pg from 'pg';
+import { PostgresPubSub } from '../src/index.ts';
+import { DATABASE_URL, dropSchema, makePubSub, uniqueSchema, waitFor } from './helpers.ts';
 
 const schema = uniqueSchema();
 const pubsubs: Array<{ close(): Promise<void> }> = [];
@@ -133,5 +135,81 @@ test('subscribeWithReplay: no duplicate when event arrives during replay', async
   // Each index should appear exactly once
   for (const [idx, count] of indexCounts) {
     assert.equal(count, 1, `index ${idx} appeared ${count} times, expected 1`);
+  }
+});
+
+test('subscribeFromOffset preserves history order before events published during replay', async () => {
+  const ps = makePubSub(schema, { pollIntervalMs: 25 });
+  pubsubs.push(ps);
+
+  for (let i = 0; i < 3; i++) {
+    await ps.publish('topic-replay-race', { type: 'history', data: i, runId: `history-${i}` });
+  }
+
+  const received: number[] = [];
+  let publishedDuringReplay = false;
+  await ps.subscribeFromOffset('topic-replay-race', 0, async (event, ack) => {
+    if (event.index !== undefined) received.push(event.index);
+    if (event.index === 0 && !publishedDuringReplay) {
+      publishedDuringReplay = true;
+      await ps.publish('topic-replay-race', { type: 'live', data: 3, runId: 'live-3' });
+    }
+    ack?.();
+  });
+
+  await waitFor(() => received.includes(3), { timeoutMs: 5_000 });
+  await ps.flush();
+
+  assert.deepEqual(received, [0, 1, 2, 3]);
+});
+
+test('subscribeWithReplay cleans up paused subscription when setup fails', async () => {
+  const cleanupSchema = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  const ps = new PostgresPubSub({
+    pool,
+    schema: cleanupSchema,
+    pollIntervalMs: 25,
+    cleanupIntervalMs: 0,
+  });
+  pubsubs.push(ps);
+
+  try {
+    await ps.publish('topic-replay-cleanup', { type: 'history', data: 0, runId: 'r' });
+
+    const originalQuery = pool.query.bind(pool) as typeof pool.query;
+    let replayAckFailed = false;
+    pool.query = ((queryText: unknown, values?: unknown) => {
+      if (
+        typeof queryText === 'string' &&
+        queryText.includes('DELETE FROM') &&
+        queryText.includes('deliveries') &&
+        queryText.includes('USING')
+      ) {
+        replayAckFailed = true;
+        return Promise.reject(new Error('forced replay ack failure'));
+      }
+      return originalQuery(queryText as never, values as never);
+    }) as typeof pool.query;
+
+    await assert.rejects(
+      () =>
+        ps.subscribeWithReplay('topic-replay-cleanup', (_event, ack) => {
+          ack?.();
+        }),
+      /forced replay ack failure/,
+    );
+    assert.equal(replayAckFailed, true);
+
+    pool.query = originalQuery;
+    const subscriptionRows = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM "${cleanupSchema}".subscriptions`,
+    );
+    assert.equal(subscriptionRows.rows[0]?.count, '0');
+  } finally {
+    pool.query = pool.query.bind(pool) as typeof pool.query;
+    await ps.close().catch(() => undefined);
+    await pool.end().catch(() => undefined);
+    await dropSchema(cleanupSchema);
   }
 });

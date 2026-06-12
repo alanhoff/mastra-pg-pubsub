@@ -59,6 +59,27 @@ test('flush does not throw when a callback throws', async () => {
   assert.ok(errors.length > 0 || true, 'error should be logged, not thrown');
 });
 
+test('flush rejects when local deliveries remain unsettled', async () => {
+  const ps = makePubSub(schema, {
+    ackDeadlineMs: 50,
+    pollIntervalMs: 25,
+    maxDeliveryAttempts: Number.POSITIVE_INFINITY,
+  });
+  pubsubs.push(ps);
+
+  await ps.subscribe('topic-flush-timeout', () => {
+    // Intentionally do not ack/nack so flush must fail loudly instead of
+    // reporting a clean drain while a delivery is still unsettled.
+  });
+
+  await ps.publish('topic-flush-timeout', { type: 'e', data: null, runId: 'r' });
+
+  await assert.rejects(
+    () => ps.flush(),
+    /PostgresPubSub flush timed out with \d+ unsettled deliveries/,
+  );
+});
+
 test('close is idempotent: call close twice, no throw', async () => {
   const ps = makePubSub(schema);
   // Don't push to pubsubs — we'll close it manually
