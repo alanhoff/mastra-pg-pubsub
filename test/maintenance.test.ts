@@ -99,30 +99,30 @@ test('retention does NOT delete events with pending deliveries', async () => {
 });
 
 test('stale private subscription pruning', async () => {
-  const ps = makePubSub(schema, {
+  const staleSchema = uniqueSchema();
+  const ps = makePubSub(staleSchema, {
     staleSubscriptionMs: 200,
     cleanupIntervalMs: 150,
     pollIntervalMs: 50,
   });
-  pubsubs.push(ps);
-
-  // Ensure schema is migrated
-  await ps.migrate();
-
   const pool = new pg.Pool({ connectionString: DATABASE_URL });
+
   try {
-    // Insert a stale private subscription row manually
+    // Ensure schema is migrated before inserting a manually stale row. This
+    // test uses a dedicated schema so maintenance timers from other tests in
+    // this file cannot prune the row before the precondition assertion.
+    await ps.migrate();
+
     const staleId = '__private:dead:staleness-test-001';
     await pool.query(
-      `INSERT INTO "${schema}".subscriptions (id, topic, is_group, last_seen_at)
+      `INSERT INTO "${staleSchema}".subscriptions (id, topic, is_group, last_seen_at)
        VALUES ($1, 'topic-stale', false, now() - interval '1 hour')
        ON CONFLICT (id) DO UPDATE SET last_seen_at = now() - interval '1 hour'`,
       [staleId],
     );
 
-    // Verify it was inserted
     const beforeResult = await pool.query<{ count: string }>(
-      `SELECT count(*)::text AS count FROM "${schema}".subscriptions WHERE id = $1`,
+      `SELECT count(*)::text AS count FROM "${staleSchema}".subscriptions WHERE id = $1`,
       [staleId],
     );
     assert.equal(
@@ -131,14 +131,13 @@ test('stale private subscription pruning', async () => {
       'stale subscription should exist before pruning',
     );
 
-    // Trigger a subscribe to kick off ensureReady and startMaintenance
+    // Trigger a subscribe to kick off ensureReady and startMaintenance.
     await ps.subscribe('topic-stale-trigger', (_, ack) => ack?.());
 
-    // Wait for maintenance to prune the stale subscription
     await waitFor(
       async () => {
         const result = await pool.query<{ count: string }>(
-          `SELECT count(*)::text AS count FROM "${schema}".subscriptions WHERE id = $1`,
+          `SELECT count(*)::text AS count FROM "${staleSchema}".subscriptions WHERE id = $1`,
           [staleId],
         );
         return result.rows[0]?.count === '0';
@@ -147,11 +146,13 @@ test('stale private subscription pruning', async () => {
     );
 
     const afterResult = await pool.query<{ count: string }>(
-      `SELECT count(*)::text AS count FROM "${schema}".subscriptions WHERE id = $1`,
+      `SELECT count(*)::text AS count FROM "${staleSchema}".subscriptions WHERE id = $1`,
       [staleId],
     );
     assert.equal(afterResult.rows[0]?.count, '0', 'stale subscription should be pruned');
   } finally {
     await pool.end();
+    await ps.close();
+    await dropSchema(staleSchema);
   }
 });
