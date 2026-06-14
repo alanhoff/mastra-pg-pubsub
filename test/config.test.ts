@@ -230,45 +230,51 @@ test('valid schema names: lowercase, underscore, digits after first char', () =>
   }
 });
 
-test('invalid numeric options throw before reaching timers or SQL', () => {
-  const invalidCases: Array<
-    [keyof import('../src/index.ts').PostgresPubSubConfig, number, RegExp]
-  > = [
-    ['pollIntervalMs', 0, /pollIntervalMs/],
-    ['pollIntervalMs', Number.NaN, /pollIntervalMs/],
-    ['ackDeadlineMs', -1, /ackDeadlineMs/],
-    ['nackDelayMs', -1, /nackDelayMs/],
-    ['batchSize', 1.5, /batchSize/],
-    ['maxEventsPerTopic', -1, /maxEventsPerTopic/],
-    ['cleanupIntervalMs', Number.POSITIVE_INFINITY, /cleanupIntervalMs/],
-    ['staleSubscriptionMs', 0, /staleSubscriptionMs/],
-    ['maxDeliveryAttempts', Number.NaN, /maxDeliveryAttempts/],
+test('invalid numeric options throw from the constructor before reaching timers or SQL', () => {
+  const invalidCases: Array<[string, Partial<Parameters<typeof PostgresPubSub>[0]>, RegExp]> = [
+    ['pollIntervalMs zero', { pollIntervalMs: 0 }, /pollIntervalMs/],
+    ['pollIntervalMs NaN', { pollIntervalMs: Number.NaN }, /pollIntervalMs/],
+    ['ackDeadlineMs negative', { ackDeadlineMs: -1 }, /ackDeadlineMs/],
+    ['nackDelayMs negative', { nackDelayMs: -1 }, /nackDelayMs/],
+    ['batchSize fractional', { batchSize: 1.5 }, /batchSize/],
+    ['maxEventsPerTopic negative', { maxEventsPerTopic: -1 }, /maxEventsPerTopic/],
+    [
+      'cleanupIntervalMs infinite',
+      { cleanupIntervalMs: Number.POSITIVE_INFINITY },
+      /cleanupIntervalMs/,
+    ],
+    ['staleSubscriptionMs zero', { staleSubscriptionMs: 0 }, /staleSubscriptionMs/],
+    ['maxDeliveryAttempts NaN', { maxDeliveryAttempts: Number.NaN }, /maxDeliveryAttempts/],
+    ['maxDeliveryAttempts negative', { maxDeliveryAttempts: -1 }, /maxDeliveryAttempts/],
   ];
 
-  for (const [option, value, message] of invalidCases) {
+  for (const [name, overrides, pattern] of invalidCases) {
     assert.throws(
       () =>
         new PostgresPubSub({
           connectionString: DATABASE_URL,
-          schema,
-          [option]: value,
+          schema: uniqueSchema(),
+          ...overrides,
         }),
-      message,
-      `${option}=${String(value)} should be rejected`,
+      pattern,
+      name,
     );
   }
 });
 
-test('numeric options allow documented zero and infinity sentinels', () => {
-  assert.doesNotThrow(() => {
-    const ps = new PostgresPubSub({
-      connectionString: DATABASE_URL,
-      schema,
-      nackDelayMs: 0,
-      maxEventsPerTopic: 0,
-      cleanupIntervalMs: 0,
-      maxDeliveryAttempts: Number.POSITIVE_INFINITY,
-    });
-    pubsubs.push(ps);
+test('numeric options accept documented zero and Infinity sentinels', () => {
+  const ps = new PostgresPubSub({
+    connectionString: DATABASE_URL,
+    schema: uniqueSchema(),
+    nackDelayMs: 0,
+    maxDeliveryAttempts: Number.POSITIVE_INFINITY,
+    maxEventsPerTopic: 0,
+    cleanupIntervalMs: 0,
+    pollIntervalMs: 1,
+    ackDeadlineMs: 1,
+    batchSize: 1,
+    staleSubscriptionMs: 1,
   });
+  pubsubs.push(ps);
+  assert.ok(ps);
 });
