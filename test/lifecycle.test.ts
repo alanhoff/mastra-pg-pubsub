@@ -172,3 +172,81 @@ test('idle stop does not close a caller-owned pool', async () => {
     await dropSchema(poolSchema);
   }
 });
+
+
+test('start retries after a transient migration failure on the same instance', async () => {
+  const retrySchema = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  const ps = new PostgresPubSub({
+    pool,
+    schema: retrySchema,
+    listen: false,
+    cleanupIntervalMs: 0,
+    pollIntervalMs: 25,
+  });
+
+  try {
+    await pool.query(`CREATE SCHEMA "${retrySchema}"`);
+    await pool.query(`CREATE VIEW "${retrySchema}".events AS SELECT 1 AS seq`);
+
+    await assert.rejects(() => ps.start());
+
+    await dropSchema(retrySchema);
+    await assert.doesNotReject(() => ps.start());
+    assert.equal(await schemaExists(retrySchema), true);
+  } finally {
+    await ps.close().catch(() => undefined);
+    await pool.end();
+    await dropSchema(retrySchema);
+  }
+});
+
+test('subscribe rolls back local and private row state when listener setup fails', async () => {
+  const rollbackSchema = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  const warnMessages: string[] = [];
+  const ps = new PostgresPubSub({
+    pool,
+    schema: rollbackSchema,
+    listen: true,
+    cleanupIntervalMs: 0,
+    pollIntervalMs: 25,
+    logger: makeTestLogger({
+      warn: (message: string) => {
+        warnMessages.push(message);
+      },
+    }),
+  });
+  const originalConnect = pool.connect.bind(pool);
+  const cb: EventCallback = (_event, ack) => ack?.();
+
+  try {
+    await ps.start();
+    pool.connect = async () => {
+      throw new Error('listen unavailable');
+    };
+
+    await assert.rejects(() => ps.subscribe('topic-rollback', cb), /listen unavailable/);
+
+    const rowCount = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM "${rollbackSchema}".subscriptions WHERE topic = $1`,
+      ['topic-rollback'],
+    );
+    assert.equal(rowCount.rows[0]?.count, '0');
+
+    pool.connect = originalConnect;
+    await ps.subscribe('topic-rollback', cb);
+    await ps.publish('topic-rollback', { type: 'after-rollback', data: null, runId: 'run-rollback' });
+    await ps.flush();
+    assert.equal(
+      warnMessages.some((message) => message.includes('failed to roll back subscription')),
+      false,
+      'rollback should complete without warning when the pool remains usable',
+    );
+  } finally {
+    pool.connect = originalConnect;
+    await ps.close().catch(() => undefined);
+    await pool.end();
+    await dropSchema(rollbackSchema);
+  }
+});

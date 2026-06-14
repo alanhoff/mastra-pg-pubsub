@@ -213,6 +213,35 @@ test('maxDeliveryAttempts=0 produces exactly one warn', () => {
   );
 });
 
+
+
+test('invalid numeric options throw before reaching timers or SQL', () => {
+  const invalidCases: Array<[string, Partial<ConstructorParameters<typeof PostgresPubSub>[0]>]> = [
+    ['pollIntervalMs', { pollIntervalMs: 0 }],
+    ['ackDeadlineMs', { ackDeadlineMs: Number.NaN }],
+    ['nackDelayMs', { nackDelayMs: -1 }],
+    ['batchSize', { batchSize: 1.5 }],
+    ['maxEventsPerTopic', { maxEventsPerTopic: Number.POSITIVE_INFINITY }],
+    ['cleanupIntervalMs', { cleanupIntervalMs: -1 }],
+    ['staleSubscriptionMs', { staleSubscriptionMs: 0 }],
+    ['maxDeliveryAttempts', { maxDeliveryAttempts: -1 }],
+  ];
+
+  for (const [option, overrides] of invalidCases) {
+    assert.throws(
+      () =>
+        new PostgresPubSub({
+          connectionString: DATABASE_URL,
+          schema,
+          cleanupIntervalMs: 0,
+          ...overrides,
+        }),
+      new RegExp(option),
+      `${option} should be validated`,
+    );
+  }
+});
+
 test('valid schema names: lowercase, underscore, digits after first char', () => {
   const validNames = ['abc', 'a_b_c', 'test123', '_private', 'my_schema_1'];
   for (const name of validNames) {

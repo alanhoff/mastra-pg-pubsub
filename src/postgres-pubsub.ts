@@ -76,18 +76,42 @@ function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
 
   return {
     schema,
-    pollIntervalMs: config.pollIntervalMs ?? 1000,
-    ackDeadlineMs: config.ackDeadlineMs ?? 30_000,
-    nackDelayMs: config.nackDelayMs ?? 0,
-    maxDeliveryAttempts,
-    batchSize: config.batchSize ?? 32,
-    maxEventsPerTopic: config.maxEventsPerTopic ?? 10_000,
-    cleanupIntervalMs: config.cleanupIntervalMs ?? 60_000,
-    staleSubscriptionMs: config.staleSubscriptionMs ?? 300_000,
+    pollIntervalMs: positiveInteger(config.pollIntervalMs ?? 1000, 'pollIntervalMs'),
+    ackDeadlineMs: positiveInteger(config.ackDeadlineMs ?? 30_000, 'ackDeadlineMs'),
+    nackDelayMs: nonNegativeInteger(config.nackDelayMs ?? 0, 'nackDelayMs'),
+    maxDeliveryAttempts: maxDeliveryAttemptLimit(maxDeliveryAttempts),
+    batchSize: positiveInteger(config.batchSize ?? 32, 'batchSize'),
+    maxEventsPerTopic: nonNegativeInteger(config.maxEventsPerTopic ?? 10_000, 'maxEventsPerTopic'),
+    cleanupIntervalMs: nonNegativeInteger(config.cleanupIntervalMs ?? 60_000, 'cleanupIntervalMs'),
+    staleSubscriptionMs: positiveInteger(config.staleSubscriptionMs ?? 300_000, 'staleSubscriptionMs'),
     listen: config.listen ?? true,
     deadLetter: config.deadLetter ?? false,
     logger,
   };
+}
+
+function positiveInteger(value: number, option: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${option} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: number, option: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${option} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function maxDeliveryAttemptLimit(value: number): number {
+  if (value === Number.POSITIVE_INFINITY) {
+    return value;
+  }
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error('maxDeliveryAttempts must be a positive safe integer, Infinity, or 0 for Infinity');
+  }
+  return value;
 }
 
 /**
@@ -108,6 +132,7 @@ export class PostgresPubSub extends PubSub {
   readonly #channel: string;
 
   readonly #subscriptions = new Map<string, Subscription>();
+  readonly #subscriptionLocks = new Map<string, Promise<void>>();
   readonly #cbIndex = new WeakMap<EventCallback, Registration[]>();
 
   #listener: NotifyListener | undefined;
@@ -180,12 +205,14 @@ export class PostgresPubSub extends PubSub {
           deadLetter: this.#config.deadLetter,
         }),
       );
-      this.#migrated = runMigration(this.#pool, this.#config.schema, this.#config.deadLetter);
+      const migration = runMigration(this.#pool, this.#config.schema, this.#config.deadLetter);
+      this.#migrated = migration;
     } else {
       span.setAttribute('migration.cached', true);
     }
+    const migration = this.#migrated;
     try {
-      await this.#migrated;
+      await migration;
       logDebug(
         this.#logger,
         'migration completed',
@@ -205,6 +232,9 @@ export class PostgresPubSub extends PubSub {
         }),
         error,
       );
+      if (this.#migrated === migration) {
+        this.#migrated = undefined;
+      }
       span.recordError(error);
       span.end({ code: 'error', message: 'migration failed' });
       throw error;
@@ -237,11 +267,20 @@ export class PostgresPubSub extends PubSub {
               schema: this.#config.schema,
             }),
           );
-          this.#started = this.#start();
+          const start = this.#start();
+          this.#started = start;
         } else {
           span.setAttribute('lifecycle.start.cached', true);
         }
-        await this.#started;
+        const start = this.#started;
+        try {
+          await start;
+        } catch (error) {
+          if (this.#started === start) {
+            this.#started = undefined;
+          }
+          throw error;
+        }
       });
       logDebug(
         this.#logger,
@@ -483,58 +522,74 @@ export class PostgresPubSub extends PubSub {
     try {
       await this.#ensureReady();
       const key = mapKey(topic, subscriptionId);
-      let sub = this.#subscriptions.get(key);
-      if (!sub) {
-        const isGroup = group !== undefined;
-        await this.#upsertSubscription(subscriptionId, topic, isGroup);
-        const registry: CallbackRegistry = { callbacks: [], cursor: 0 };
-        const loop = new ConsumeLoop(
-          this.#pool,
-          this.#config.schema,
-          this.#config,
+      return await this.#serializeSubscriptionSetup(key, async () => {
+        let sub = this.#subscriptions.get(key);
+        if (!sub) {
+          const isGroup = group !== undefined;
+          await this.#upsertSubscription(subscriptionId, topic, isGroup);
+          const registry: CallbackRegistry = { callbacks: [], cursor: 0 };
+          const loop = new ConsumeLoop(
+            this.#pool,
+            this.#config.schema,
+            this.#config,
+            topic,
+            subscriptionId,
+            isGroup,
+            registry,
+          );
+          sub = {
+            id: subscriptionId,
+            topic,
+            isGroup,
+            registry,
+            loop,
+            started: false,
+            unregisterWake: undefined,
+          };
+          this.#subscriptions.set(key, sub);
+          created = true;
+        }
+
+        try {
+          if (startImmediately) {
+            await this.#startSubscription(sub);
+          }
+          this.#addCallbackRegistration(userKey, sub, registered);
+          if (startImmediately) {
+            sub.loop.wake();
+          }
+        } catch (error) {
+          if (created) {
+            await this.#rollbackCreatedSubscription(sub).catch((rollbackError) => {
+              logWarn(
+                this.#logger,
+                'failed to roll back subscription after setup failure',
+                traceAttributes({
+                  topic,
+                  subscriptionId,
+                  subscriptionKind,
+                }),
+                rollbackError,
+              );
+            });
+          }
+          throw error;
+        }
+        const context = traceAttributes({
           topic,
           subscriptionId,
-          isGroup,
-          registry,
-        );
-        sub = {
-          id: subscriptionId,
-          topic,
-          isGroup,
-          registry,
-          loop,
-          started: false,
-          unregisterWake: undefined,
-        };
-        this.#subscriptions.set(key, sub);
-        created = true;
-      }
-
-      sub.registry.callbacks.push(registered);
-      let registrations = this.#cbIndex.get(userKey);
-      if (!registrations) {
-        registrations = [];
-        this.#cbIndex.set(userKey, registrations);
-      }
-      registrations.push({ sub, registered });
-      if (startImmediately) {
-        await this.#startSubscription(sub);
-        sub.loop.wake();
-      }
-      const context = traceAttributes({
-        topic,
-        subscriptionId,
-        subscriptionKind,
-        callbackCount: sub.registry.callbacks.length,
-        created,
-        started: sub.started,
+          subscriptionKind,
+          callbackCount: sub.registry.callbacks.length,
+          created,
+          started: sub.started,
+        });
+        logDebug(this.#logger, 'subscription registered', context);
+        span.setAttribute('subscription.id', subscriptionId);
+        span.setAttribute('subscription.created', created);
+        span.setAttribute('callback.count', sub.registry.callbacks.length);
+        span.end();
+        return sub;
       });
-      logDebug(this.#logger, 'subscription registered', context);
-      span.setAttribute('subscription.id', subscriptionId);
-      span.setAttribute('subscription.created', created);
-      span.setAttribute('callback.count', sub.registry.callbacks.length);
-      span.end();
-      return sub;
     } catch (error) {
       logError(
         this.#logger,
@@ -552,15 +607,57 @@ export class PostgresPubSub extends PubSub {
     }
   }
 
+
+  async #serializeSubscriptionSetup<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.#subscriptionLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const lock = previous.then(
+      () => next,
+      () => next,
+    );
+    this.#subscriptionLocks.set(key, lock);
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.#subscriptionLocks.get(key) === lock) {
+        this.#subscriptionLocks.delete(key);
+      }
+    }
+  }
+
+  #addCallbackRegistration(userKey: EventCallback, sub: Subscription, registered: EventCallback): void {
+    sub.registry.callbacks.push(registered);
+    let registrations = this.#cbIndex.get(userKey);
+    if (!registrations) {
+      registrations = [];
+      this.#cbIndex.set(userKey, registrations);
+    }
+    registrations.push({ sub, registered });
+  }
+
+  async #rollbackCreatedSubscription(sub: Subscription): Promise<void> {
+    this.#subscriptions.delete(mapKey(sub.topic, sub.id));
+    sub.unregisterWake?.();
+    await sub.loop.stop();
+    if (!sub.isGroup) {
+      await this.#pool.query(`DELETE FROM ${this.#q('subscriptions')} WHERE id = $1`, [sub.id]);
+    }
+  }
+
   async #startSubscription(sub: Subscription): Promise<void> {
     if (sub.started) {
       return;
     }
-    sub.loop.start();
-    sub.started = true;
     if (this.#config.listen) {
       await this.#registerWake(sub);
     }
+    sub.loop.start();
+    sub.started = true;
     const context = traceAttributes({
       topic: sub.topic,
       subscriptionId: sub.id,
@@ -1117,6 +1214,43 @@ export class PostgresPubSub extends PubSub {
     return result.rowCount ?? 0;
   }
 
+
+  async #closeListener(): Promise<void> {
+    if (!this.#listener) {
+      return;
+    }
+    await this.#listener.close();
+    this.#listener = undefined;
+  }
+
+  async #clearSubscriptions(): Promise<string[]> {
+    const privateIds = [...this.#subscriptions.values()]
+      .filter((s) => !s.isGroup)
+      .map((s) => s.id);
+    this.#subscriptions.clear();
+    if (privateIds.length > 0) {
+      await this.#pool
+        .query(`DELETE FROM ${this.#q('subscriptions')} WHERE id = ANY($1::text[])`, [privateIds])
+        .catch((error) =>
+          logWarn(
+            this.#logger,
+            'failed to delete private subscriptions',
+            traceAttributes({
+              privateSubscriptionCount: privateIds.length,
+            }),
+            error,
+          ),
+        );
+    }
+    return privateIds;
+  }
+
+  async #closeOwnedPool(): Promise<void> {
+    if (this.#ownsPool) {
+      await this.#pool.end();
+    }
+  }
+
   /**
    * Stop all loops, release the listener, delete this instance's private
    * subscriptions, and end the pool when the adapter created it. Idempotent.
@@ -1158,33 +1292,10 @@ export class PostgresPubSub extends PubSub {
       }
       await Promise.all([...this.#subscriptions.values()].map((s) => s.loop.stop()));
 
-      if (this.#listener) {
-        await this.#listener.close();
-        this.#listener = undefined;
-      }
+      await this.#closeListener();
 
-      const privateIds = [...this.#subscriptions.values()]
-        .filter((s) => !s.isGroup)
-        .map((s) => s.id);
-      this.#subscriptions.clear();
-      if (privateIds.length > 0) {
-        await this.#pool
-          .query(`DELETE FROM ${this.#q('subscriptions')} WHERE id = ANY($1::text[])`, [privateIds])
-          .catch((error) =>
-            logWarn(
-              this.#logger,
-              'failed to delete private subscriptions',
-              traceAttributes({
-                privateSubscriptionCount: privateIds.length,
-              }),
-              error,
-            ),
-          );
-      }
-
-      if (this.#ownsPool) {
-        await this.#pool.end();
-      }
+      const privateIds = await this.#clearSubscriptions();
+      await this.#closeOwnedPool();
       const context = traceAttributes({
         schema: this.#config.schema,
         ownsPool: this.#ownsPool,
