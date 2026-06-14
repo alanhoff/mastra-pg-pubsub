@@ -76,11 +76,11 @@ jobs:
           node-version: 24.x
           cache: npm
       - run: npm ci
-      - name: Run key-free PubSub semantics e2e
+      - name: Run key-free PubSub e2e
         run: npm run test:e2e:semantics
-      - name: Skip OpenAI-backed Mastra e2e without OpenAI key
+      - name: Skip OpenAI-backed Mastra e2e without key
         if: env.OPENAI_API_KEY == ''
-        run: echo "OPENAI_API_KEY is not configured; skipping OpenAI-backed Mastra e2e."
+        run: echo "OPENAI_API_KEY is not configured; key-free e2e already ran."
       - name: Run OpenAI-backed Mastra e2e
         if: env.OPENAI_API_KEY != ''
         run: |
