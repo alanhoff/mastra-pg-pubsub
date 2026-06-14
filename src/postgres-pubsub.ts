@@ -102,14 +102,19 @@ function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
 
   return {
     schema,
-    pollIntervalMs: positiveInteger(config.pollIntervalMs ?? 1000, 'pollIntervalMs'),
-    ackDeadlineMs: positiveInteger(config.ackDeadlineMs ?? 30_000, 'ackDeadlineMs'),
-    nackDelayMs: nonNegativeInteger(config.nackDelayMs ?? 0, 'nackDelayMs'),
-    maxDeliveryAttempts: maxDeliveryAttemptLimit(maxDeliveryAttempts),
-    batchSize: positiveInteger(config.batchSize ?? 32, 'batchSize'),
-    maxEventsPerTopic: nonNegativeInteger(config.maxEventsPerTopic ?? 10_000, 'maxEventsPerTopic'),
-    cleanupIntervalMs: nonNegativeInteger(config.cleanupIntervalMs ?? 60_000, 'cleanupIntervalMs'),
-    staleSubscriptionMs: positiveInteger(config.staleSubscriptionMs ?? 300_000, 'staleSubscriptionMs'),
+    pollIntervalMs: integerOption('pollIntervalMs', config.pollIntervalMs, 1000, 1),
+    ackDeadlineMs: integerOption('ackDeadlineMs', config.ackDeadlineMs, 30_000, 1),
+    nackDelayMs: integerOption('nackDelayMs', config.nackDelayMs, 0, 0),
+    maxDeliveryAttempts: maxDeliveryAttemptsOption(config.maxDeliveryAttempts, logger),
+    batchSize: integerOption('batchSize', config.batchSize, 32, 1),
+    maxEventsPerTopic: integerOption('maxEventsPerTopic', config.maxEventsPerTopic, 10_000, 0),
+    cleanupIntervalMs: integerOption('cleanupIntervalMs', config.cleanupIntervalMs, 60_000, 0),
+    staleSubscriptionMs: integerOption(
+      'staleSubscriptionMs',
+      config.staleSubscriptionMs,
+      300_000,
+      1,
+    ),
     listen: config.listen ?? true,
     deadLetter: config.deadLetter ?? false,
     logger,
@@ -262,28 +267,8 @@ export class PostgresPubSub extends PubSub {
         if (this.#closed) {
           throw new Error('PostgresPubSub is closed');
         }
-        if (!this.#started) {
-          logDebug(
-            this.#logger,
-            'postgres pubsub start started',
-            traceAttributes({
-              schema: this.#config.schema,
-            }),
-          );
-          const start = this.#start();
-          this.#started = start;
-        } else {
-          span.setAttribute('lifecycle.start.cached', true);
-        }
-        const start = this.#started;
-        try {
-          await start;
-        } catch (error) {
-          if (this.#started === start) {
-            this.#started = undefined;
-          }
-          throw error;
-        }
+        const start = this.#getStartPromise(span);
+        await this.#awaitStartPromise(start);
       });
       logDebug(
         this.#logger,
@@ -548,14 +533,12 @@ export class PostgresPubSub extends PubSub {
       }),
     );
     let created = false;
-    let sub: Subscription | undefined;
     const subscriptionId = group
       ? groupSubscriptionId(topic, group)
       : `__private:${this.#instanceId}:${randomUUID()}`;
     const key = mapKey(topic, subscriptionId);
     try {
       await this.#ensureReady();
-      const key = mapKey(topic, subscriptionId);
       return await this.#serializeSubscriptionSetup(key, async () => {
         let sub = this.#subscriptions.get(key);
         if (!sub) {
@@ -635,15 +618,11 @@ export class PostgresPubSub extends PubSub {
         }),
         error,
       );
-      if (sub) {
-        await this.#rollbackRegistration(sub, userKey, registered, created);
-      }
       span.recordError(error);
       span.end({ code: 'error', message: 'subscription registration failed' });
       throw error;
     }
   }
-
 
   async #serializeSubscriptionSetup<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.#subscriptionLocks.get(key) ?? Promise.resolve();
@@ -667,7 +646,11 @@ export class PostgresPubSub extends PubSub {
     }
   }
 
-  #addCallbackRegistration(userKey: EventCallback, sub: Subscription, registered: EventCallback): void {
+  #addCallbackRegistration(
+    userKey: EventCallback,
+    sub: Subscription,
+    registered: EventCallback,
+  ): void {
     sub.registry.callbacks.push(registered);
     let registrations = this.#cbIndex.get(userKey);
     if (!registrations) {
@@ -1259,6 +1242,24 @@ export class PostgresPubSub extends PubSub {
     return result.rowCount ?? 0;
   }
 
+  #clearMaintenanceTimer(): void {
+    if (!this.#maintenanceTimer) {
+      return;
+    }
+    clearInterval(this.#maintenanceTimer);
+    this.#maintenanceTimer = undefined;
+  }
+
+  async #settlePendingPublishes(): Promise<void> {
+    await Promise.allSettled([...this.#pendingPublishes]);
+  }
+
+  async #stopSubscriptionLoops(): Promise<void> {
+    for (const sub of this.#subscriptions.values()) {
+      sub.unregisterWake?.();
+    }
+    await Promise.all([...this.#subscriptions.values()].map((s) => s.loop.stop()));
+  }
 
   async #closeListener(): Promise<void> {
     if (!this.#listener) {
@@ -1269,9 +1270,7 @@ export class PostgresPubSub extends PubSub {
   }
 
   async #clearSubscriptions(): Promise<string[]> {
-    const privateIds = [...this.#subscriptions.values()]
-      .filter((s) => !s.isGroup)
-      .map((s) => s.id);
+    const privateIds = [...this.#subscriptions.values()].filter((s) => !s.isGroup).map((s) => s.id);
     this.#subscriptions.clear();
     if (privateIds.length > 0) {
       await this.#pool
@@ -1328,15 +1327,6 @@ export class PostgresPubSub extends PubSub {
       this.#clearMaintenanceTimer();
       await this.#settlePendingPublishes();
       await this.#stopSubscriptionLoops();
-      await this.#closeListener();
-
-      await Promise.allSettled([...this.#pendingPublishes]);
-
-      for (const sub of this.#subscriptions.values()) {
-        sub.unregisterWake?.();
-      }
-      await Promise.all([...this.#subscriptions.values()].map((s) => s.loop.stop()));
-
       await this.#closeListener();
 
       const privateIds = await this.#clearSubscriptions();

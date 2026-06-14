@@ -213,8 +213,6 @@ test('maxDeliveryAttempts=0 produces exactly one warn', () => {
   );
 });
 
-
-
 test('invalid numeric options throw before reaching timers or SQL', () => {
   const invalidCases: Array<[string, Partial<ConstructorParameters<typeof PostgresPubSub>[0]>]> = [
     ['pollIntervalMs', { pollIntervalMs: 0 }],

@@ -613,6 +613,63 @@ test('failure deleting a private subscription on unsubscribe is caught and logge
   }
 });
 
+test('failed subscription setup logs when rollback deletion also fails', async () => {
+  const schemaRollbackFailure = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 2 });
+  const warnMessages: string[] = [];
+  const ps = new PostgresPubSub({
+    pool,
+    schema: schemaRollbackFailure,
+    listen: true,
+    cleanupIntervalMs: 0,
+    pollIntervalMs: 100,
+    logger: makeTestLogger({
+      warn: (message: string) => {
+        warnMessages.push(message);
+      },
+    }),
+  });
+  const originalConnect = pool.connect.bind(pool);
+  const originalQuery = pool.query.bind(pool);
+
+  try {
+    await ps.migrate();
+    let connectCalls = 0;
+    pool.connect = (async (...args: []) => {
+      connectCalls++;
+      if (connectCalls === 2) {
+        throw new Error('listen connect failed');
+      }
+      return originalConnect(...args);
+    }) as typeof pool.connect;
+    pool.query = (async (...args: Parameters<typeof pool.query>) => {
+      const sql = String(args[0]);
+      if (sql.startsWith('DELETE FROM') && sql.includes('subscriptions')) {
+        throw new Error('rollback delete failed');
+      }
+      return await originalQuery(...args);
+    }) as typeof pool.query;
+
+    await assert.rejects(
+      () =>
+        ps.subscribe('topic-rollback-warning', (_event, ack) => {
+          ack?.();
+        }),
+      /listen connect failed/,
+    );
+    assert.ok(
+      warnMessages.some((message) => message.includes('failed to roll back subscription')),
+      'rollback failure should be logged via logger.warn',
+    );
+  } finally {
+    pool.connect = originalConnect as typeof pool.connect;
+    pool.query = originalQuery as typeof pool.query;
+    await ps.close().catch(() => undefined);
+    await pool.end();
+    await dropSchema(schemaRollbackFailure);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Test 17: migration rollback branch (schema.ts catch). A pre-existing view
 // named events makes the later CREATE INDEX fail after the transaction starts.

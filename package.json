@@ -1,6 +1,6 @@
 {
   "name": "mastra-pg-pubsub",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "PostgreSQL-backed PubSub adapter for Mastra: at-least-once delivery, consumer groups, replay from offset, dead-lettering, and low-latency LISTEN/NOTIFY wakeups.",
   "type": "module",
   "license": "MIT",
