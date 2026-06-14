@@ -1038,6 +1038,7 @@ export class PostgresPubSub extends PubSub {
 
     try {
       const replayedIndexes: number[] = [];
+      let replayCallbackErrorCount = 0;
       const history = await this.getHistory(topic, offset);
       for (const event of history) {
         if (event.index !== undefined && seen.has(event.index)) {
@@ -1049,6 +1050,7 @@ export class PostgresPubSub extends PubSub {
             replayedIndexes.push(event.index);
           }
         } catch (error) {
+          replayCallbackErrorCount++;
           logError(
             this.#logger,
             'replay callback threw',
@@ -1074,9 +1076,16 @@ export class PostgresPubSub extends PubSub {
         offset,
         subscriptionId: sub.id,
         replayedCount: replayedIndexes.length,
+        replayCallbackErrorCount,
+        replayCallbackStatus: replayCallbackErrorCount > 0 ? 'error' : 'ok',
       });
       logDebug(this.#logger, 'subscribe from offset completed', context);
       span.setAttribute('replayed.count', replayedIndexes.length);
+      span.setAttribute('replay.callback_error_count', replayCallbackErrorCount);
+      span.setAttribute(
+        'replay.callback_status',
+        replayCallbackErrorCount > 0 ? 'error' : 'ok',
+      );
       span.end();
     } catch (error) {
       try {

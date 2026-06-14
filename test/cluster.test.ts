@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { type ChildProcess, fork } from 'node:child_process';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { dropSchema, uniqueSchema, waitFor } from './helpers.ts';
+import { DATABASE_URL, dropSchema, uniqueSchema, waitFor } from './helpers.ts';
 
 interface ReplyMessage {
   readonly type: 'reply';
@@ -67,7 +67,9 @@ class ClusterWorker {
     const workerPath = fileURLToPath(new URL('./fixtures/cluster-worker.ts', import.meta.url));
     this.#child = fork(workerPath, [], {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
-      env: workerEnv(),
+      env: {
+        DATABASE_URL,
+      },
       execArgv: [],
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });

@@ -30,8 +30,8 @@
   },
   "sideEffects": false,
   "files": [
-    "dist",
-    "!dist/**/*.map",
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
     "CHANGELOG.md"
   ],
   "exports": {
@@ -52,8 +52,8 @@
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down -v",
     "test:e2e": "npm run test:e2e:semantics && npm run test:e2e:mastra",
-    "test:e2e:semantics": "node --test 'test/e2e/semantics.e2e.test.ts'",
-    "test:e2e:mastra": "node --env-file-if-exists=.env --test 'test/e2e/mastra-integration.e2e.test.ts'"
+    "test:e2e:semantics": "node --env-file-if-exists=.env --test test/e2e/semantics.e2e.test.ts",
+    "test:e2e:mastra": "node --env-file-if-exists=.env --test test/e2e/mastra-integration.e2e.test.ts"
   },
   "dependencies": {
     "pg": "^8.16.0",
