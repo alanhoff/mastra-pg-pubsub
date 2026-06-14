@@ -1,70 +1,5 @@
+import type { IMastraLogger } from '@mastra/core/logger';
 import type { Pool } from 'pg';
-
-/**
- * A minimal log function. Compatible with `console.log`-style signatures and
- * with structured loggers that accept a message plus arbitrary context.
- */
-export type LogFn = (message: string, ...context: unknown[]) => void;
-
-/**
- * Optional logger injected into {@link PostgresPubSub}. Every method is
- * optional; when the whole logger (or an individual method) is absent the
- * adapter stays silent. Expected races (lost claims, redelivery) log at
- * `debug`; recoverable problems at `warn`; unexpected failures at `error`.
- */
-export interface PubSubLogger {
-  /** Verbose, expected-path diagnostics (claim races, wakeups, polls). */
-  debug?: LogFn;
-  /** Recoverable anomalies (dropped events, exhausted retries, stale prune). */
-  warn?: LogFn;
-  /** Unexpected failures inside background loops. */
-  error?: LogFn;
-}
-
-/** Scalar values that can be safely attached to trace spans and events. */
-export type PubSubTraceAttributeValue = string | number | boolean | null;
-
-/** Payload-safe trace attributes emitted by the adapter. */
-export type PubSubTraceAttributes = Record<string, PubSubTraceAttributeValue>;
-
-/** Minimal span status shape for package-neutral tracer adapters. */
-export interface PubSubTraceStatus {
-  code: 'ok' | 'error';
-  message?: string;
-}
-
-/**
- * Minimal span contract used by {@link PubSubTracer}. This intentionally avoids
- * importing a telemetry SDK; callers can adapt it to OpenTelemetry or any other
- * tracing implementation.
- */
-export interface PubSubTraceSpan {
-  setAttribute?: (name: string, value: PubSubTraceAttributeValue) => void;
-  setAttributes?: (attributes: PubSubTraceAttributes) => void;
-  recordException?: (error: unknown) => void;
-  setStatus?: (status: PubSubTraceStatus) => void;
-  end?: () => void;
-}
-
-/**
- * Optional tracer injected into {@link PostgresPubSub}. The adapter emits
- * payload-safe spans and events and swallows tracer failures so instrumentation
- * cannot affect PubSub behavior.
- */
-export interface PubSubTracer {
-  startSpan?: (name: string, attributes: PubSubTraceAttributes) => PubSubTraceSpan | undefined;
-  event?: (name: string, attributes: PubSubTraceAttributes) => void;
-}
-
-/**
- * Minimal structural contract used by {@link PostgresPubSub.wireMastraLifecycle}.
- * It intentionally avoids depending on Mastra internals beyond the public
- * lifecycle methods this adapter wraps.
- */
-export interface MastraLifecycleHost {
-  startWorkers(name?: string): Promise<void>;
-  shutdown(): Promise<void>;
-}
 
 /**
  * Configuration for {@link PostgresPubSub}.
@@ -88,8 +23,8 @@ export interface PostgresPubSubConfig {
   pool?: Pool;
   /**
    * PostgreSQL schema that holds every table. Must match
-   * `^[a-z_][a-z0-9_]*$` and must not start with PostgreSQL's reserved
-   * `pg_` prefix. Defaults to `mastra_pg_pubsub`.
+   * `^[a-z_][a-z0-9_]*$`. Defaults to `pg_pubsub`; other custom schema names
+   * that start with PostgreSQL's reserved `pg_` prefix are rejected.
    */
   schema?: string;
   /**
@@ -145,10 +80,12 @@ export interface PostgresPubSubConfig {
    * table instead of discarding them silently. Defaults to `false`.
    */
   deadLetter?: boolean;
-  /** Optional logger; silent when omitted. */
-  logger?: PubSubLogger;
-  /** Optional tracer; silent when omitted. */
-  tracer?: PubSubTracer;
+  /**
+   * Optional logger with the same shape accepted by `new Mastra({ logger })`.
+   * When omitted, PubSub resolves the current Mastra span and uses its
+   * observability logger. Pass `false` to force silence.
+   */
+  logger?: IMastraLogger | false;
 }
 
 /**
@@ -166,6 +103,5 @@ export interface ResolvedConfig {
   staleSubscriptionMs: number;
   listen: boolean;
   deadLetter: boolean;
-  logger: PubSubLogger;
-  tracer: PubSubTracer;
+  logger: IMastraLogger | false | undefined;
 }

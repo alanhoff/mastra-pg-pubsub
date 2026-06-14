@@ -1,30 +1,42 @@
-import type {
-  PubSubLogger,
-  PubSubTraceAttributes,
-  PubSubTraceAttributeValue,
-  PubSubTracer,
-  PubSubTraceSpan,
-  PubSubTraceStatus,
-} from './types.ts';
+import type { IMastraLogger } from '@mastra/core/logger';
+import {
+  type AnySpan,
+  executeWithContext,
+  resolveCurrentSpan,
+  SpanType,
+} from '@mastra/core/observability';
 
 type LogLevel = 'debug' | 'warn' | 'error';
 
-type TraceAttributeSource = Record<string, PubSubTraceAttributeValue | undefined>;
+export type PubSubAttributeValue = string | number | boolean | null;
 
-export interface ActiveTraceSpan {
-  setAttribute(name: string, value: PubSubTraceAttributeValue | undefined): void;
-  recordError(error: unknown): void;
-  end(status?: PubSubTraceStatus): void;
+export type PubSubAttributes = Record<string, PubSubAttributeValue>;
+
+type AttributeSource = Record<string, PubSubAttributeValue | undefined>;
+
+type ConfiguredLogger = IMastraLogger | false | undefined;
+
+export interface SpanStatus {
+  code: 'ok' | 'error';
+  message?: string;
 }
 
-const noopSpan: ActiveTraceSpan = {
+export interface ActiveObservabilitySpan {
+  setAttribute(name: string, value: PubSubAttributeValue | undefined): void;
+  recordError(error: unknown): void;
+  run<T>(fn: () => Promise<T>): Promise<T>;
+  end(status?: SpanStatus): void;
+}
+
+const noopSpan: ActiveObservabilitySpan = {
   setAttribute: () => undefined,
   recordError: () => undefined,
+  run: async (fn) => fn(),
   end: () => undefined,
 };
 
-export function traceAttributes(source: TraceAttributeSource = {}): PubSubTraceAttributes {
-  const attributes: PubSubTraceAttributes = {};
+export function traceAttributes(source: AttributeSource = {}): PubSubAttributes {
+  const attributes: PubSubAttributes = {};
   for (const [key, value] of Object.entries(source)) {
     if (value !== undefined) {
       attributes[key] = value;
@@ -34,61 +46,85 @@ export function traceAttributes(source: TraceAttributeSource = {}): PubSubTraceA
 }
 
 export function logDebug(
-  logger: PubSubLogger,
+  logger: ConfiguredLogger,
   message: string,
-  context?: PubSubTraceAttributes,
+  context?: PubSubAttributes,
 ): void {
   log(logger, 'debug', message, context);
 }
 
 export function logWarn(
-  logger: PubSubLogger,
+  logger: ConfiguredLogger,
   message: string,
-  context?: PubSubTraceAttributes,
+  context?: PubSubAttributes,
   error?: unknown,
 ): void {
   log(logger, 'warn', message, context, error);
 }
 
 export function logError(
-  logger: PubSubLogger,
+  logger: ConfiguredLogger,
   message: string,
-  context?: PubSubTraceAttributes,
+  context?: PubSubAttributes,
   error?: unknown,
 ): void {
   log(logger, 'error', message, context, error);
 }
 
-export function traceEvent(
-  tracer: PubSubTracer,
-  name: string,
-  attributes: PubSubTraceAttributes = {},
-): void {
-  safeCall(() => tracer.event?.(name, attributes));
+export function observeEvent(name: string, attributes: PubSubAttributes = {}): void {
+  const parent = currentSpan();
+  if (!parent) {
+    return;
+  }
+  safeCall(() => {
+    parent.createEventSpan({
+      type: SpanType.GENERIC,
+      name,
+      attributes,
+      output: attributes,
+    });
+  });
 }
 
-export function startTraceSpan(
-  tracer: PubSubTracer,
+export function startObservabilitySpan(
   name: string,
-  attributes: PubSubTraceAttributes = {},
-): ActiveTraceSpan {
-  if (!tracer.startSpan && !tracer.event) {
+  attributes: PubSubAttributes = {},
+): ActiveObservabilitySpan {
+  const parent = currentSpan();
+  if (!parent) {
     return noopSpan;
   }
-  return new SafeTraceSpan(tracer, name, attributes);
+
+  let child: AnySpan | undefined;
+  safeCall(() => {
+    child = parent.createChildSpan({
+      type: SpanType.GENERIC,
+      name,
+      attributes,
+    });
+  });
+  if (!child) {
+    return noopSpan;
+  }
+  return new SafeObservabilitySpan(child, attributes);
 }
 
 function log(
-  logger: PubSubLogger,
+  configuredLogger: ConfiguredLogger,
   level: LogLevel,
   message: string,
-  context?: PubSubTraceAttributes,
+  context?: PubSubAttributes,
   error?: unknown,
 ): void {
-  const fn = logger[level];
-  if (!fn) {
+  if (configuredLogger === false) {
     return;
   }
+
+  const logger = configuredLogger ?? currentSpanLogger();
+  if (!logger) {
+    return;
+  }
+
   safeCall(() => {
     const safeContext =
       error === undefined
@@ -98,24 +134,45 @@ function log(
             ...errorAttributes(error),
           };
     if (safeContext && Object.keys(safeContext).length > 0) {
-      fn(message, safeContext);
+      logger[level](message, safeContext);
     } else if (error !== undefined) {
-      fn(message, errorAttributes(error));
+      logger[level](message, errorAttributes(error));
     } else {
-      fn(message);
+      logger[level](message);
     }
   });
+}
+
+function currentSpanLogger(): IMastraLogger | undefined {
+  const span = currentSpan();
+  if (!span) {
+    return undefined;
+  }
+
+  let logger: IMastraLogger | undefined;
+  safeCall(() => {
+    logger = span.observabilityInstance?.getLogger?.();
+  });
+  return logger;
+}
+
+function currentSpan(): AnySpan | undefined {
+  let span: AnySpan | undefined;
+  safeCall(() => {
+    span = resolveCurrentSpan();
+  });
+  return span;
 }
 
 function safeCall(fn: () => void): void {
   try {
     fn();
   } catch {
-    // Observability sinks must never change PubSub behavior.
+    // Observability must never change PubSub behavior.
   }
 }
 
-function errorAttributes(error: unknown): PubSubTraceAttributes {
+function errorAttributes(error: unknown): PubSubAttributes {
   if (error instanceof Error) {
     return traceAttributes({
       'error.name': error.name,
@@ -126,40 +183,31 @@ function errorAttributes(error: unknown): PubSubTraceAttributes {
   });
 }
 
-function safeTraceException(error: unknown): Error {
+function safeSpanError(error: unknown): Error {
   const name = error instanceof Error ? error.name : typeof error;
   const safeError = new Error(name);
   safeError.name = name;
   return safeError;
 }
 
-class SafeTraceSpan implements ActiveTraceSpan {
-  readonly #tracer: PubSubTracer;
-  readonly #name: string;
-  readonly #attributes: PubSubTraceAttributes;
+class SafeObservabilitySpan implements ActiveObservabilitySpan {
+  readonly #span: AnySpan;
+  readonly #attributes: PubSubAttributes;
   readonly #startedAt = Date.now();
-  readonly #span: PubSubTraceSpan | undefined;
   #ended = false;
 
-  constructor(tracer: PubSubTracer, name: string, attributes: PubSubTraceAttributes) {
-    this.#tracer = tracer;
-    this.#name = name;
-    this.#attributes = { ...attributes };
-    traceEvent(this.#tracer, `${this.#name}.start`, this.#attributes);
-    let span: PubSubTraceSpan | undefined;
-    safeCall(() => {
-      span = this.#tracer.startSpan?.(this.#name, this.#attributes);
-    });
+  constructor(span: AnySpan, attributes: PubSubAttributes) {
     this.#span = span;
+    this.#attributes = { ...attributes };
   }
 
-  setAttribute(name: string, value: PubSubTraceAttributeValue | undefined): void {
+  setAttribute(name: string, value: PubSubAttributeValue | undefined): void {
     if (value === undefined) {
       return;
     }
     this.#attributes[name] = value;
     safeCall(() => {
-      this.#span?.setAttribute?.(name, value);
+      this.#span.update({ attributes: { [name]: value } });
     });
   }
 
@@ -169,15 +217,19 @@ class SafeTraceSpan implements ActiveTraceSpan {
       this.setAttribute(key, value);
     }
     safeCall(() => {
-      this.#span?.recordException?.(safeTraceException(error));
-    });
-    traceEvent(this.#tracer, `${this.#name}.error`, {
-      ...this.#attributes,
-      ...attributes,
+      this.#span.error({
+        error: safeSpanError(error),
+        attributes,
+        endSpan: false,
+      });
     });
   }
 
-  end(status: PubSubTraceStatus = { code: 'ok' }): void {
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    return executeWithContext({ span: this.#span, fn });
+  }
+
+  end(status: SpanStatus = { code: 'ok' }): void {
     if (this.#ended) {
       return;
     }
@@ -188,10 +240,7 @@ class SafeTraceSpan implements ActiveTraceSpan {
     }
     this.setAttribute('duration.ms', Date.now() - this.#startedAt);
     safeCall(() => {
-      this.#span?.setAttributes?.(this.#attributes);
-      this.#span?.setStatus?.(status);
-      this.#span?.end?.();
+      this.#span.end({ attributes: this.#attributes });
     });
-    traceEvent(this.#tracer, `${this.#name}.end`, this.#attributes);
   }
 }

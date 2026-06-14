@@ -7,6 +7,7 @@ import {
   dropSchema,
   isDisposableTestDatabase,
   makePubSub,
+  makeTestLogger,
   schemaExists,
   tableExists,
   uniqueSchema,
@@ -21,7 +22,7 @@ after(async () => {
 });
 
 test('invalid schema names throw from the constructor', () => {
-  const invalidNames = ['Bad-Name', '1abc', 'has space', 'with-dash', 'pg_pubsub', ''];
+  const invalidNames = ['Bad-Name', '1abc', 'has space', 'with-dash', 'pg_internal', ''];
   for (const name of invalidNames) {
     assert.throws(
       () =>
@@ -105,12 +106,12 @@ test('concurrent migrate across two instances does not error', async () => {
   });
 });
 
-test('schema defaults to mastra_pg_pubsub and auto-creates the schema when not provided', async (t) => {
+test('schema defaults to pg_pubsub and auto-creates the schema when not provided', async (t) => {
   if (!isDisposableTestDatabase()) {
     t.skip('default-schema drop is only safe against the disposable local test database');
     return;
   }
-  await dropSchema('mastra_pg_pubsub');
+  await dropSchema('pg_pubsub');
   const ps = new PostgresPubSub({
     connectionString: DATABASE_URL,
     cleanupIntervalMs: 0,
@@ -118,12 +119,58 @@ test('schema defaults to mastra_pg_pubsub and auto-creates the schema when not p
   });
   try {
     await ps.migrate();
-    assert.equal(await schemaExists('mastra_pg_pubsub'), true);
-    assert.equal(await tableExists('mastra_pg_pubsub', 'events'), true);
-    assert.equal(await tableExists('mastra_pg_pubsub', 'subscriptions'), true);
+    assert.equal(await schemaExists('pg_pubsub'), true);
+    assert.equal(await tableExists('pg_pubsub', 'events'), true);
+    assert.equal(await tableExists('pg_pubsub', 'subscriptions'), true);
   } finally {
     await ps.close();
-    await dropSchema('mastra_pg_pubsub');
+    await dropSchema('pg_pubsub');
+  }
+});
+
+test('pre-created default schema can migrate with an ordinary schema-scoped role', async (t) => {
+  if (!isDisposableTestDatabase()) {
+    t.skip('role management is only safe against the disposable local test database');
+    return;
+  }
+
+  const role = uniqueSchema().replace(/^test_/, 'app_');
+  const password = `pw_${role}`;
+  const adminPool = new pg.Pool({ connectionString: DATABASE_URL });
+  const lowPrivilegeUrl = new URL(DATABASE_URL);
+  lowPrivilegeUrl.username = role;
+  lowPrivilegeUrl.password = password;
+  let ps: PostgresPubSub | undefined;
+
+  try {
+    await adminPool.query('DROP SCHEMA IF EXISTS "pg_pubsub" CASCADE');
+    await adminPool.query(`DROP ROLE IF EXISTS "${role}"`);
+    await adminPool.query(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}'`);
+    try {
+      await adminPool.query('BEGIN');
+      await adminPool.query('SET LOCAL allow_system_table_mods = on');
+      await adminPool.query('CREATE SCHEMA "pg_pubsub"');
+      await adminPool.query('COMMIT');
+    } catch (error) {
+      await adminPool.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    }
+    await adminPool.query(`GRANT USAGE, CREATE ON SCHEMA "pg_pubsub" TO "${role}"`);
+
+    ps = new PostgresPubSub({
+      connectionString: lowPrivilegeUrl.toString(),
+      cleanupIntervalMs: 0,
+      pollIntervalMs: 100,
+    });
+
+    await ps.migrate();
+    assert.equal(await schemaExists('pg_pubsub'), true);
+    assert.equal(await tableExists('pg_pubsub', 'events'), true);
+  } finally {
+    await ps?.close().catch(() => undefined);
+    await adminPool.query('DROP SCHEMA IF EXISTS "pg_pubsub" CASCADE');
+    await adminPool.query(`DROP ROLE IF EXISTS "${role}"`);
+    await adminPool.end();
   }
 });
 
@@ -153,9 +200,9 @@ test('maxDeliveryAttempts=0 produces exactly one warn', () => {
     maxDeliveryAttempts: 0,
     cleanupIntervalMs: 0,
     pollIntervalMs: 100,
-    logger: {
+    logger: makeTestLogger({
       warn: (msg: string) => warnings.push(msg),
-    },
+    }),
   });
   pubsubs.push(ps);
 

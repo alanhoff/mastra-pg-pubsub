@@ -1,7 +1,13 @@
 import type { Pool, PoolClient } from 'pg';
-import { logDebug, logWarn, startTraceSpan, traceAttributes, traceEvent } from './observability.ts';
+import {
+  logDebug,
+  logWarn,
+  observeEvent,
+  startObservabilitySpan,
+  traceAttributes,
+} from './observability.ts';
 import { notifyChannel, quoteIdentifier } from './sql.ts';
-import type { PubSubLogger, PubSubTracer } from './types.ts';
+import type { ResolvedConfig } from './types.ts';
 
 /**
  * Owns a single dedicated `LISTEN` connection and dispatches `NOTIFY` payloads
@@ -12,8 +18,7 @@ import type { PubSubLogger, PubSubTracer } from './types.ts';
 export class NotifyListener {
   readonly #pool: Pool;
   readonly #channel: string;
-  readonly #logger: PubSubLogger;
-  readonly #tracer: PubSubTracer;
+  readonly #logger: ResolvedConfig['logger'];
   readonly #handlers = new Map<string, Set<() => void>>();
   #client: PoolClient | undefined;
   #connecting: Promise<void> | undefined;
@@ -23,13 +28,11 @@ export class NotifyListener {
    * @param pool - Pool used to acquire the dedicated listen connection.
    * @param schema - Validated schema name; determines the channel.
    * @param logger - Logger for connection diagnostics.
-   * @param tracer - Tracer for listener lifecycle diagnostics.
    */
-  constructor(pool: Pool, schema: string, logger: PubSubLogger, tracer: PubSubTracer) {
+  constructor(pool: Pool, schema: string, logger: ResolvedConfig['logger']) {
     this.#pool = pool;
     this.#channel = notifyChannel(schema);
     this.#logger = logger;
-    this.#tracer = tracer;
   }
 
   /**
@@ -55,7 +58,7 @@ export class NotifyListener {
       topicCount: this.#handlers.size,
     });
     logDebug(this.#logger, 'listen handler registered', context);
-    traceEvent(this.#tracer, 'pg_pubsub.listener.handler_registered', context);
+    observeEvent('pg_pubsub.listener.handler_registered', context);
     return () => {
       const current = this.#handlers.get(topic);
       if (current) {
@@ -70,7 +73,7 @@ export class NotifyListener {
           topicCount: this.#handlers.size,
         });
         logDebug(this.#logger, 'listen handler unregistered', unregisterContext);
-        traceEvent(this.#tracer, 'pg_pubsub.listener.handler_unregistered', unregisterContext);
+        observeEvent('pg_pubsub.listener.handler_unregistered', unregisterContext);
       }
     };
   }
@@ -88,8 +91,7 @@ export class NotifyListener {
   }
 
   async #connect(): Promise<void> {
-    const span = startTraceSpan(
-      this.#tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.listener.connect',
       traceAttributes({
         channel: this.#channel,
@@ -109,7 +111,7 @@ export class NotifyListener {
           handlerCount: handlers?.size ?? 0,
         });
         logDebug(this.#logger, 'notification received', context);
-        traceEvent(this.#tracer, 'pg_pubsub.listener.notification', context);
+        observeEvent('pg_pubsub.listener.notification', context);
         if (handlers) {
           for (const handler of handlers) {
             handler();
@@ -124,8 +126,7 @@ export class NotifyListener {
             channel: this.#channel,
           }),
         );
-        traceEvent(
-          this.#tracer,
+        observeEvent(
           'pg_pubsub.listener.error',
           traceAttributes({
             channel: this.#channel,
@@ -171,7 +172,7 @@ export class NotifyListener {
       topicCount: this.#handlers.size,
     });
     logDebug(this.#logger, 'listen connection disconnected', context);
-    traceEvent(this.#tracer, 'pg_pubsub.listener.disconnected', context);
+    observeEvent('pg_pubsub.listener.disconnected', context);
     if (this.#closed || this.#handlers.size === 0) {
       return;
     }
@@ -192,8 +193,7 @@ export class NotifyListener {
    * Release the listen connection and stop dispatching. Idempotent.
    */
   async close(): Promise<void> {
-    const span = startTraceSpan(
-      this.#tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.listener.close',
       traceAttributes({
         channel: this.#channel,

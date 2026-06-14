@@ -1,9 +1,11 @@
 import type { Pool, PoolClient } from 'pg';
 import { advisoryLockKey, assertValidSchema, quoteIdentifier } from './sql.ts';
 
+const DEFAULT_RESERVED_SCHEMA = 'pg_pubsub';
+
 /**
- * Build the ordered list of DDL statements that create the schema and all
- * tables. Idempotent: every statement uses `IF NOT EXISTS`.
+ * Build the ordered list of DDL statements that create all tables. Idempotent:
+ * every statement uses `IF NOT EXISTS`.
  *
  * @param schema - The validated, unquoted schema name.
  * @param deadLetter - Whether to include the optional `dead_events` table.
@@ -12,7 +14,6 @@ import { advisoryLockKey, assertValidSchema, quoteIdentifier } from './sql.ts';
 export function buildDdl(schema: string, deadLetter: boolean): string[] {
   const s = quoteIdentifier(schema);
   const statements: string[] = [
-    `CREATE SCHEMA IF NOT EXISTS ${s}`,
     `CREATE TABLE IF NOT EXISTS ${s}.topics (
        topic TEXT PRIMARY KEY,
        next_index BIGINT NOT NULL DEFAULT 0
@@ -72,6 +73,29 @@ export function buildDdl(schema: string, deadLetter: boolean): string[] {
   return statements;
 }
 
+async function schemaExists(client: PoolClient, schema: string): Promise<boolean> {
+  const result = await client.query<{ exists: boolean }>(
+    'SELECT to_regnamespace($1) IS NOT NULL AS exists',
+    [schema],
+  );
+  return result.rows[0]?.exists === true;
+}
+
+async function createSchema(client: PoolClient, schema: string): Promise<void> {
+  if (schema === DEFAULT_RESERVED_SCHEMA) {
+    try {
+      await client.query('SET LOCAL allow_system_table_mods = on');
+    } catch (cause) {
+      throw new Error(
+        'Unable to create default schema "pg_pubsub": PostgreSQL reserves the pg_ prefix, so auto-creation requires a migration role allowed to set allow_system_table_mods. Pre-create the schema with an administrator role or configure an ordinary custom schema name.',
+        { cause },
+      );
+    }
+  }
+
+  await client.query(`CREATE SCHEMA ${quoteIdentifier(schema)}`);
+}
+
 /**
  * Create the schema and tables under a transaction-scoped advisory lock so
  * concurrent instances serialize their migrations. Idempotent and safe to call
@@ -88,6 +112,9 @@ export async function runMigration(pool: Pool, schema: string, deadLetter: boole
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock($1)', [key]);
+    if (!(await schemaExists(client, schema))) {
+      await createSchema(client, schema);
+    }
     for (const statement of buildDdl(schema, deadLetter)) {
       await client.query(statement);
     }

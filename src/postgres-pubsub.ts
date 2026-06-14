@@ -8,20 +8,15 @@ import {
   logDebug,
   logError,
   logWarn,
-  startTraceSpan,
+  observeEvent,
+  startObservabilitySpan,
   traceAttributes,
-  traceEvent,
 } from './observability.ts';
 import { runMigration } from './schema.ts';
 import { assertValidSchema, notifyChannel, quoteIdentifier } from './sql.ts';
-import type {
-  MastraLifecycleHost,
-  PostgresPubSubConfig,
-  PubSubLogger,
-  ResolvedConfig,
-} from './types.ts';
+import type { PostgresPubSubConfig, ResolvedConfig } from './types.ts';
 
-const DEFAULT_SCHEMA = 'mastra_pg_pubsub';
+const DEFAULT_SCHEMA = 'pg_pubsub';
 
 interface Subscription {
   readonly id: string;
@@ -62,8 +57,7 @@ function groupSubscriptionId(topic: string, group: string): string {
 }
 
 function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
-  const logger = config.logger ?? {};
-  const tracer = config.tracer ?? {};
+  const logger = config.logger;
   const schema = config.schema ?? DEFAULT_SCHEMA;
   assertValidSchema(schema);
 
@@ -93,7 +87,6 @@ function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
     listen: config.listen ?? true,
     deadLetter: config.deadLetter ?? false,
     logger,
-    tracer,
   };
 }
 
@@ -110,7 +103,7 @@ export class PostgresPubSub extends PubSub {
   readonly #config: ResolvedConfig;
   readonly #pool: pg.Pool;
   readonly #ownsPool: boolean;
-  readonly #logger: PubSubLogger;
+  readonly #logger: ResolvedConfig['logger'];
   readonly #instanceId: string;
   readonly #channel: string;
 
@@ -120,10 +113,10 @@ export class PostgresPubSub extends PubSub {
   #listener: NotifyListener | undefined;
   #migrated: Promise<void> | undefined;
   #started: Promise<void> | undefined;
+  #lifecycleLock: Promise<void> = Promise.resolve();
   #maintenanceTimer: NodeJS.Timeout | undefined;
   #closed = false;
   #pendingPublishes = new Set<Promise<void>>();
-  readonly #wiredMastraHosts = new WeakSet<MastraLifecycleHost>();
 
   /**
    * @param config - Adapter configuration. Provide exactly one of
@@ -158,7 +151,7 @@ export class PostgresPubSub extends PubSub {
       channel: this.#channel,
     });
     logDebug(this.#logger, 'postgres pubsub initialized', context);
-    traceEvent(this.#config.tracer, 'pg_pubsub.instance.created', context);
+    observeEvent('pg_pubsub.instance.created', context);
   }
 
   #q(table: string): string {
@@ -171,8 +164,7 @@ export class PostgresPubSub extends PubSub {
    * called, migration happens lazily on first use.
    */
   async migrate(): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.migrate',
       traceAttributes({
         schema: this.#config.schema,
@@ -221,12 +213,10 @@ export class PostgresPubSub extends PubSub {
 
   /**
    * Start the adapter lifecycle explicitly. This migrates the configured
-   * schema and starts maintenance once. Direct PubSub methods call this lazily,
-   * while {@link wireMastraLifecycle} calls it before Mastra starts workers.
+   * schema and starts maintenance once. Direct PubSub methods call this lazily.
    */
   async start(): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.lifecycle.start',
       traceAttributes({
         schema: this.#config.schema,
@@ -234,34 +224,25 @@ export class PostgresPubSub extends PubSub {
         deadLetter: this.#config.deadLetter,
       }),
     );
-    if (this.#closed) {
-      const error = new Error('PostgresPubSub is closed');
-      logWarn(
-        this.#logger,
-        'postgres pubsub start skipped for closed pubsub',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-        error,
-      );
-      span.recordError(error);
-      span.end({ code: 'error', message: 'pubsub is closed' });
-      throw error;
-    }
-    if (!this.#started) {
-      logDebug(
-        this.#logger,
-        'postgres pubsub start started',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-      );
-      this.#started = this.#start();
-    } else {
-      span.setAttribute('lifecycle.start.cached', true);
-    }
     try {
-      await this.#started;
+      await this.#serializeLifecycle(async () => {
+        if (this.#closed) {
+          throw new Error('PostgresPubSub is closed');
+        }
+        if (!this.#started) {
+          logDebug(
+            this.#logger,
+            'postgres pubsub start started',
+            traceAttributes({
+              schema: this.#config.schema,
+            }),
+          );
+          this.#started = this.#start();
+        } else {
+          span.setAttribute('lifecycle.start.cached', true);
+        }
+        await this.#started;
+      });
       logDebug(
         this.#logger,
         'postgres pubsub started',
@@ -271,14 +252,11 @@ export class PostgresPubSub extends PubSub {
       );
       span.end();
     } catch (error) {
-      logError(
-        this.#logger,
-        'postgres pubsub start failed',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-        error,
-      );
+      const message =
+        error instanceof Error && error.message === 'PostgresPubSub is closed'
+          ? 'postgres pubsub start skipped for closed pubsub'
+          : 'postgres pubsub start failed';
+      logError(this.#logger, message, traceAttributes({ schema: this.#config.schema }), error);
       span.recordError(error);
       span.end({ code: 'error', message: 'pubsub start failed' });
       throw error;
@@ -295,340 +273,26 @@ export class PostgresPubSub extends PubSub {
     this.#startMaintenance();
   }
 
-  /**
-   * Wire this adapter to a Mastra instance's lifecycle. Current Mastra versions
-   * call `flush()` during shutdown but do not close custom PubSub instances, so
-   * this bridge starts the adapter before `startWorkers()` and closes it after
-   * `shutdown()`. The wiring is instance-local and idempotent.
-   *
-   * @param mastra - A Mastra instance or compatible lifecycle host.
-   * @returns The same host for fluent construction patterns.
-   */
-  wireMastraLifecycle<T extends MastraLifecycleHost>(mastra: T): T {
-    const span = startTraceSpan(
-      this.#config.tracer,
-      'pg_pubsub.lifecycle.mastra.wire',
-      traceAttributes({
-        schema: this.#config.schema,
-      }),
+  async #serializeLifecycle<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.#lifecycleLock;
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#lifecycleLock = previous.then(
+      () => next,
+      () => next,
     );
-    if (typeof mastra.startWorkers !== 'function' || typeof mastra.shutdown !== 'function') {
-      const error = new Error('Mastra lifecycle host must provide startWorkers() and shutdown()');
-      logError(
-        this.#logger,
-        'mastra lifecycle wiring failed',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-        error,
-      );
-      span.recordError(error);
-      span.end({ code: 'error', message: 'invalid lifecycle host' });
-      throw error;
-    }
-    if (this.#wiredMastraHosts.has(mastra)) {
-      logDebug(
-        this.#logger,
-        'mastra lifecycle already wired',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-      );
-      span.setAttribute('lifecycle.already_wired', true);
-      span.end();
-      return mastra;
-    }
-
-    const pubsub = this;
-    const originalStartWorkers = mastra.startWorkers;
-    const originalShutdown = mastra.shutdown;
-
-    mastra.startWorkers = async function startWorkers(name?: string): Promise<void> {
-      await pubsub.#runMastraStartWorkersHook(this, originalStartWorkers, originalShutdown, name);
-    };
-    mastra.shutdown = async function shutdown(): Promise<void> {
-      await pubsub.#runMastraShutdownHook(this, originalShutdown);
-    };
-
-    this.#wiredMastraHosts.add(mastra);
-    logDebug(
-      this.#logger,
-      'mastra lifecycle wired',
-      traceAttributes({
-        schema: this.#config.schema,
-      }),
-    );
-    traceEvent(
-      this.#config.tracer,
-      'pg_pubsub.lifecycle.mastra.wired',
-      traceAttributes({
-        schema: this.#config.schema,
-      }),
-    );
-    span.end();
-    return mastra;
-  }
-
-  async #runMastraStartWorkersHook(
-    host: MastraLifecycleHost,
-    originalStartWorkers: MastraLifecycleHost['startWorkers'],
-    originalShutdown: MastraLifecycleHost['shutdown'],
-    name: string | undefined,
-  ): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
-      'pg_pubsub.lifecycle.mastra.start_workers',
-      traceAttributes({
-        schema: this.#config.schema,
-        workerName: name ?? null,
-      }),
-    );
-    let pubsubStartAttempted = false;
-    let pubsubStarted = false;
-    let hostStartAttempted = false;
+    await previous.catch(() => undefined);
     try {
-      logDebug(
-        this.#logger,
-        'mastra lifecycle startWorkers hook started',
-        traceAttributes({
-          schema: this.#config.schema,
-          workerName: name ?? null,
-        }),
-      );
-      pubsubStartAttempted = true;
-      await this.start();
-      pubsubStarted = true;
-      hostStartAttempted = true;
-      await originalStartWorkers.call(host, name);
-      logDebug(
-        this.#logger,
-        'mastra lifecycle startWorkers hook completed',
-        traceAttributes({
-          schema: this.#config.schema,
-          workerName: name ?? null,
-        }),
-      );
-      span.end();
-    } catch (error) {
-      logError(
-        this.#logger,
-        'mastra lifecycle startWorkers hook failed',
-        traceAttributes({
-          schema: this.#config.schema,
-          workerName: name ?? null,
-          pubsubStartAttempted,
-          pubsubStarted,
-          hostStartAttempted,
-        }),
-        error,
-      );
-      span.recordError(error);
-      if (pubsubStartAttempted) {
-        await this.#cleanupAfterMastraStartFailure(
-          span,
-          host,
-          originalShutdown,
-          hostStartAttempted,
-        );
-      }
-      span.end({ code: 'error', message: 'mastra startWorkers failed' });
-      throw error;
+      return await fn();
+    } finally {
+      release();
     }
-  }
-
-  async #cleanupAfterMastraStartFailure(
-    span: ReturnType<typeof startTraceSpan>,
-    host: MastraLifecycleHost,
-    originalShutdown: MastraLifecycleHost['shutdown'],
-    hostStartAttempted: boolean,
-  ): Promise<void> {
-    let rollbackError: unknown;
-    if (hostStartAttempted) {
-      try {
-        await originalShutdown.call(host);
-        logDebug(
-          this.#logger,
-          'mastra lifecycle startup failure host rollback completed',
-          traceAttributes({
-            schema: this.#config.schema,
-          }),
-        );
-        span.setAttribute('startup_failure.host_rollback_completed', true);
-        traceEvent(
-          this.#config.tracer,
-          'pg_pubsub.lifecycle.mastra.startup_failure_host_rollback',
-          traceAttributes({
-            schema: this.#config.schema,
-            status: 'complete',
-          }),
-        );
-      } catch (error) {
-        rollbackError = error;
-        logWarn(
-          this.#logger,
-          'mastra lifecycle startup failure host rollback failed',
-          traceAttributes({
-            schema: this.#config.schema,
-          }),
-          error,
-        );
-        span.setAttribute('startup_failure.host_rollback_completed', false);
-        span.recordError(error);
-      }
-    }
-
-    if (isPubSubFlushTimeoutError(rollbackError)) {
-      this.#recordDirtyShutdownCloseSkipped(span, 'startup_failure');
-      return;
-    }
-
-    try {
-      await this.close();
-      logDebug(
-        this.#logger,
-        'mastra lifecycle startup failure cleanup completed',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-      );
-      span.setAttribute('startup_failure.cleanup_closed', true);
-      traceEvent(
-        this.#config.tracer,
-        'pg_pubsub.lifecycle.mastra.startup_failure_cleanup',
-        traceAttributes({
-          schema: this.#config.schema,
-          status: 'complete',
-        }),
-      );
-    } catch (cleanupError) {
-      logWarn(
-        this.#logger,
-        'mastra lifecycle startup failure cleanup failed',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-        cleanupError,
-      );
-      span.setAttribute('startup_failure.cleanup_closed', false);
-      span.recordError(cleanupError);
-    }
-  }
-
-  async #runMastraShutdownHook(
-    host: MastraLifecycleHost,
-    originalShutdown: MastraLifecycleHost['shutdown'],
-  ): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
-      'pg_pubsub.lifecycle.mastra.shutdown',
-      traceAttributes({
-        schema: this.#config.schema,
-      }),
-    );
-    let shutdownError: unknown;
-    try {
-      logDebug(
-        this.#logger,
-        'mastra lifecycle shutdown hook started',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-      );
-      await originalShutdown.call(host);
-    } catch (error) {
-      shutdownError = error;
-      logError(
-        this.#logger,
-        'mastra lifecycle shutdown hook failed before pubsub close',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-        error,
-      );
-      span.recordError(error);
-    }
-
-    if (isPubSubFlushTimeoutError(shutdownError)) {
-      this.#recordDirtyShutdownCloseSkipped(span, 'shutdown');
-      span.end({ code: 'error', message: 'mastra shutdown failed' });
-      throw shutdownError;
-    }
-
-    try {
-      await this.close();
-      span.setAttribute('shutdown.close_completed', true);
-    } catch (closeError) {
-      logError(
-        this.#logger,
-        'mastra lifecycle pubsub close failed',
-        traceAttributes({
-          schema: this.#config.schema,
-        }),
-        closeError,
-      );
-      span.setAttribute('shutdown.close_completed', false);
-      span.recordError(closeError);
-      if (shutdownError === undefined) {
-        span.end({ code: 'error', message: 'pubsub close failed' });
-        throw closeError;
-      }
-    }
-
-    if (shutdownError !== undefined) {
-      span.end({ code: 'error', message: 'mastra shutdown failed' });
-      throw shutdownError;
-    }
-
-    logDebug(
-      this.#logger,
-      'mastra lifecycle shutdown hook completed',
-      traceAttributes({
-        schema: this.#config.schema,
-      }),
-    );
-    traceEvent(
-      this.#config.tracer,
-      'pg_pubsub.lifecycle.mastra.shutdown_completed',
-      traceAttributes({
-        schema: this.#config.schema,
-      }),
-    );
-    span.end();
-  }
-
-  #recordDirtyShutdownCloseSkipped(
-    span: ReturnType<typeof startTraceSpan>,
-    lifecyclePhase: 'shutdown' | 'startup_failure',
-  ): void {
-    logWarn(
-      this.#logger,
-      'mastra lifecycle pubsub close skipped after dirty shutdown',
-      traceAttributes({
-        schema: this.#config.schema,
-        lifecyclePhase,
-      }),
-    );
-    span.setAttribute(`${lifecyclePhase}.close_skipped`, true);
-    traceEvent(
-      this.#config.tracer,
-      'pg_pubsub.lifecycle.mastra.pubsub_close_skipped',
-      traceAttributes({
-        schema: this.#config.schema,
-        lifecyclePhase,
-        reason: 'flush_timeout',
-      }),
-    );
   }
 
   async #ensureReady(): Promise<void> {
-    if (this.#closed) {
-      throw new Error('PostgresPubSub is closed');
-    }
-    if (!this.#started) {
-      await this.start();
-      return;
-    }
-    await this.#started;
+    await this.start();
   }
 
   /**
@@ -658,8 +322,7 @@ export class PostgresPubSub extends PubSub {
 
   async #publish(topic: string, event: Omit<Event, 'id' | 'createdAt'>): Promise<void> {
     const id = randomUUID();
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.publish',
       traceAttributes({
         topic,
@@ -769,7 +432,7 @@ export class PostgresPubSub extends PubSub {
         localSubscriptionCount: woken,
       });
       logDebug(this.#logger, 'woke local subscriptions', context);
-      traceEvent(this.#config.tracer, 'pg_pubsub.local_wake', context);
+      observeEvent('pg_pubsub.local_wake', context);
     }
   }
 
@@ -805,8 +468,7 @@ export class PostgresPubSub extends PubSub {
     startImmediately = true,
   ): Promise<Subscription> {
     const subscriptionKind = group === undefined ? 'private' : 'group';
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.subscribe',
       traceAttributes({
         topic,
@@ -906,17 +568,12 @@ export class PostgresPubSub extends PubSub {
       listen: this.#config.listen,
     });
     logDebug(this.#logger, 'subscription loop started', context);
-    traceEvent(this.#config.tracer, 'pg_pubsub.subscription.started', context);
+    observeEvent('pg_pubsub.subscription.started', context);
   }
 
   async #registerWake(sub: Subscription): Promise<void> {
     if (!this.#listener) {
-      this.#listener = new NotifyListener(
-        this.#pool,
-        this.#config.schema,
-        this.#logger,
-        this.#config.tracer,
-      );
+      this.#listener = new NotifyListener(this.#pool, this.#config.schema, this.#logger);
     }
     sub.unregisterWake = await this.#listener.register(sub.topic, () => sub.loop.wake());
     const context = traceAttributes({
@@ -925,7 +582,7 @@ export class PostgresPubSub extends PubSub {
       subscriptionKind: sub.isGroup ? 'group' : 'private',
     });
     logDebug(this.#logger, 'subscription wake registered', context);
-    traceEvent(this.#config.tracer, 'pg_pubsub.subscription.wake_registered', context);
+    observeEvent('pg_pubsub.subscription.wake_registered', context);
   }
 
   async #upsertSubscription(id: string, topic: string, isGroup: boolean): Promise<void> {
@@ -946,8 +603,7 @@ export class PostgresPubSub extends PubSub {
    * @param cb - The callback to remove.
    */
   override async unsubscribe(topic: string, cb: EventCallback): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.unsubscribe',
       traceAttributes({
         topic,
@@ -999,6 +655,9 @@ export class PostgresPubSub extends PubSub {
     span.setAttribute('unsubscribe.matched', removedCallbacks > 0);
     span.setAttribute('callback.removed_count', removedCallbacks);
     span.setAttribute('subscription.torn_down_count', tornDownSubscriptions);
+    if (tornDownSubscriptions > 0 && this.#subscriptions.size === 0) {
+      await this.#stopIdleResources();
+    }
     span.end();
   }
 
@@ -1013,7 +672,7 @@ export class PostgresPubSub extends PubSub {
       subscriptionKind: sub.isGroup ? 'group' : 'private',
     });
     logDebug(this.#logger, 'subscription torn down', context);
-    traceEvent(this.#config.tracer, 'pg_pubsub.subscription.torn_down', context);
+    observeEvent('pg_pubsub.subscription.torn_down', context);
     if (!sub.isGroup) {
       await this.#pool
         .query(`DELETE FROM ${this.#q('subscriptions')} WHERE id = $1`, [sub.id])
@@ -1032,6 +691,58 @@ export class PostgresPubSub extends PubSub {
     }
   }
 
+  async #stopIdleResources(): Promise<void> {
+    const span = startObservabilitySpan(
+      'pg_pubsub.lifecycle.idle_stop',
+      traceAttributes({
+        schema: this.#config.schema,
+        listen: this.#config.listen,
+        cleanupIntervalMs: this.#config.cleanupIntervalMs,
+        subscriptionCount: this.#subscriptions.size,
+      }),
+    );
+    try {
+      await this.#serializeLifecycle(async () => {
+        if (this.#closed || this.#subscriptions.size > 0) {
+          span.setAttribute('lifecycle.idle_stop.skipped', true);
+          return;
+        }
+
+        if (this.#maintenanceTimer) {
+          clearInterval(this.#maintenanceTimer);
+          this.#maintenanceTimer = undefined;
+        }
+
+        if (this.#listener) {
+          await this.#listener.close();
+          this.#listener = undefined;
+        }
+
+        this.#started = undefined;
+      });
+
+      const context = traceAttributes({
+        schema: this.#config.schema,
+        listen: this.#config.listen,
+        cleanupIntervalMs: this.#config.cleanupIntervalMs,
+      });
+      logDebug(this.#logger, 'postgres pubsub idle resources stopped', context);
+      observeEvent('pg_pubsub.lifecycle.idle_stopped', context);
+      span.end();
+    } catch (error) {
+      logWarn(
+        this.#logger,
+        'postgres pubsub idle resource stop failed',
+        traceAttributes({
+          schema: this.#config.schema,
+        }),
+        error,
+      );
+      span.recordError(error);
+      span.end({ code: 'error', message: 'idle stop failed' });
+    }
+  }
+
   /**
    * Resolve once all in-flight publishes and local deliveries have settled.
    * Per-event callback errors are logged, never thrown. If locally-owned
@@ -1039,8 +750,7 @@ export class PostgresPubSub extends PubSub {
    * shutdown callers do not mistake a stuck subscriber for a clean drain.
    */
   override async flush(): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.flush',
       traceAttributes({
         pendingPublishes: this.#pendingPublishes.size,
@@ -1121,8 +831,7 @@ export class PostgresPubSub extends PubSub {
    * @returns Events in ascending `index` order.
    */
   override async getHistory(topic: string, offset = 0): Promise<Event[]> {
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.get_history',
       traceAttributes({
         topic,
@@ -1188,8 +897,7 @@ export class PostgresPubSub extends PubSub {
     offset: number,
     cb: EventCallback,
   ): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.subscribe_from_offset',
       traceAttributes({
         topic,
@@ -1307,7 +1015,7 @@ export class PostgresPubSub extends PubSub {
       settledDeliveryCount: result.rowCount ?? 0,
     });
     logDebug(this.#logger, 'replayed deliveries settled', context);
-    traceEvent(this.#config.tracer, 'pg_pubsub.replay.settled', context);
+    observeEvent('pg_pubsub.replay.settled', context);
   }
 
   #startMaintenance(): void {
@@ -1324,12 +1032,11 @@ export class PostgresPubSub extends PubSub {
       maxEventsPerTopic: this.#config.maxEventsPerTopic,
     });
     logDebug(this.#logger, 'maintenance started', context);
-    traceEvent(this.#config.tracer, 'pg_pubsub.maintenance.started', context);
+    observeEvent('pg_pubsub.maintenance.started', context);
   }
 
   async #runMaintenance(): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.maintenance.cycle',
       traceAttributes({
         schema: this.#config.schema,
@@ -1415,8 +1122,7 @@ export class PostgresPubSub extends PubSub {
    * subscriptions, and end the pool when the adapter created it. Idempotent.
    */
   async close(): Promise<void> {
-    const span = startTraceSpan(
-      this.#config.tracer,
+    const span = startObservabilitySpan(
       'pg_pubsub.close',
       traceAttributes({
         schema: this.#config.schema,
@@ -1513,8 +1219,4 @@ function rowToEvent(row: EventRow): Event {
     createdAt: row.created_at,
     index: Number(row.index),
   };
-}
-
-function isPubSubFlushTimeoutError(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith('PostgresPubSub flush timed out with ');
 }

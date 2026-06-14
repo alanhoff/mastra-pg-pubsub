@@ -2,36 +2,35 @@
 
 All notable changes to this project will be documented here.
 
+## 0.3.0 - 2026-06-14
+
+### Changed
+
+- Rewrote lifecycle handling as a breaking change: the adapter now starts lazily on database use and stops idle listener/maintenance resources after the final local subscriber is removed.
+- Changed the default schema to `pg_pubsub`; migration auto-creates it and still allows ordinary custom schema names.
+- Changed `logger` to accept Mastra's logger shape. When omitted, PubSub resolves the current Mastra span and uses that span's observability logger; `logger: false` silences PubSub logs.
+- Reworked observability around Mastra current-span context, generic child spans, event spans, and sanitized scalar attributes.
+
+### Removed
+
+- Removed obsolete lifecycle and explicit observability sink APIs from the public package surface.
+
 ## 0.2.1 - 2026-06-14
 
 ### Changed
 
-- Re-published the Mastra lifecycle release with explicit upgrade notes for the
-  `mastra_pg_pubsub` default schema and the `schema: 'mastra_pubsub'` opt-in for
-  existing deployments that need to keep using old tables.
-- Documented that `wireMastraLifecycle()` intentionally wraps the current Mastra
-  `startWorkers()` and `shutdown()` lifecycle methods, so projects should
-  re-run the lifecycle and cluster tests when upgrading `@mastra/core`.
+- Improved lifecycle release notes and schema guidance.
 
 ## 0.2.0 - 2026-06-14
 
 ### Added
 
-- Added `wireMastraLifecycle(mastra)` to migrate before Mastra workers start,
-  close gracefully after Mastra shutdown, and preserve unsettled delivery
-  evidence when a shutdown drain times out.
-- Added package-neutral logging and tracing hooks across lifecycle, delivery,
-  listener, maintenance, replay, flush, and shutdown paths.
-- Added clustered Mastra process tests that prove fan-out, consumer-group
-  delivery, and history work across multiple app instances.
+- Added an earlier lifecycle and observability integration pass across startup, delivery, listener, maintenance, replay, flush, and shutdown paths.
+- Added clustered Mastra process tests that prove fan-out, consumer-group delivery, and history work across multiple app instances.
 
 ### Changed
 
-- Changed the default schema to `mastra_pg_pubsub`, which is auto-created during
-  migration. Existing installs can opt into `schema: 'mastra_pubsub'` to keep
-  using their old tables.
-- Rejected schemas that start with PostgreSQL's reserved `pg_` prefix, including
-  the literal `pg_pubsub` name.
+- Moved the package away from the original schema default and documented explicit schema selection for existing deployments.
 
 ## 0.1.0 - 2026-06-12
 

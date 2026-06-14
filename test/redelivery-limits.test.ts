@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import pg from 'pg';
-import { DATABASE_URL, dropSchema, makePubSub, sleep, uniqueSchema, waitFor } from './helpers.ts';
+import {
+  DATABASE_URL,
+  dropSchema,
+  makePubSub,
+  makeTestLogger,
+  sleep,
+  uniqueSchema,
+  waitFor,
+} from './helpers.ts';
 
 const schema = uniqueSchema();
 const pubsubs: Array<{ close(): Promise<void> }> = [];
@@ -98,11 +106,11 @@ test('maxDeliveryAttempts=0 logs a warn and behaves as unbounded', async () => {
     maxDeliveryAttempts: 0,
     ackDeadlineMs: 100,
     pollIntervalMs: 50,
-    logger: {
+    logger: makeTestLogger({
       warn: (msg: string) => {
         warnings.push(msg);
       },
-    },
+    }),
   });
   pubsubs.push(ps);
 

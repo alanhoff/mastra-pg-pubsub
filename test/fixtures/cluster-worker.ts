@@ -131,7 +131,6 @@ async function handleCommand(command: Command): Promise<void> {
         cleanupIntervalMs: 0,
       });
       mastra = new Mastra({ pubsub, logger: false });
-      pubsub.wireMastraLifecycle(mastra);
       await mastra.startWorkers();
       sendReply(command.id, {
         workerId,

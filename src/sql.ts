@@ -8,7 +8,8 @@ const SCHEMA_PATTERN = /^[a-z_][a-z0-9_]*$/;
 
 /**
  * Validate a PostgreSQL schema name against `^[a-z_][a-z0-9_]*$` and reject
- * PostgreSQL's reserved `pg_` prefix before a migration reaches the server.
+ * PostgreSQL's reserved `pg_` prefix before a migration reaches the server,
+ * except for this package's default `pg_pubsub` schema.
  *
  * @param schema - Candidate schema name.
  * @returns The same schema name when valid.
@@ -20,7 +21,7 @@ export function assertValidSchema(schema: string): string {
       `Invalid schema name ${JSON.stringify(schema)}: must match ${SCHEMA_PATTERN.source}`,
     );
   }
-  if (schema.startsWith('pg_')) {
+  if (schema.startsWith('pg_') && schema !== 'pg_pubsub') {
     throw new Error(
       `Invalid schema name ${JSON.stringify(schema)}: PostgreSQL reserves the pg_ prefix for system schemas`,
     );

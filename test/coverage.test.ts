@@ -3,7 +3,15 @@ import { after, test } from 'node:test';
 import type { Event, EventCallback } from '@mastra/core/events';
 import pg from 'pg';
 import { PostgresPubSub } from '../src/index.ts';
-import { DATABASE_URL, dropSchema, makePubSub, sleep, uniqueSchema, waitFor } from './helpers.ts';
+import {
+  DATABASE_URL,
+  dropSchema,
+  makePubSub,
+  makeTestLogger,
+  sleep,
+  uniqueSchema,
+  waitFor,
+} from './helpers.ts';
 
 // Shared schema for most tests; separate schemas for isolation where needed.
 const schema = uniqueSchema();
@@ -398,11 +406,11 @@ test('listener error handler, disconnect, and reconnect failure paths', async ()
     schema: schemaKill,
     pollIntervalMs: 10_000,
     listen: true,
-    logger: {
+    logger: makeTestLogger({
       warn: (msg: string) => {
         warnMessages.push(msg);
       },
-    },
+    }),
   });
 
   try {
@@ -541,11 +549,11 @@ test('a failing maintenance cycle is caught and logged, not thrown', async () =>
     listen: false,
     pollIntervalMs: 100,
     cleanupIntervalMs: 80,
-    logger: {
+    logger: makeTestLogger({
       warn: (msg: string) => {
         warnMessages.push(msg);
       },
-    },
+    }),
   });
 
   try {
@@ -580,11 +588,11 @@ test('failure deleting a private subscription on unsubscribe is caught and logge
     listen: false,
     pollIntervalMs: 100,
     cleanupIntervalMs: 0,
-    logger: {
+    logger: makeTestLogger({
       warn: (msg: string) => {
         warnMessages.push(msg);
       },
-    },
+    }),
   });
 
   try {
@@ -602,5 +610,56 @@ test('failure deleting a private subscription on unsubscribe is caught and logge
   } finally {
     await ps.close().catch(() => undefined);
     await dropSchema(schemaTeardown);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test 17: migration rollback branch (schema.ts catch). A pre-existing view
+// named events makes the later CREATE INDEX fail after the transaction starts.
+// ---------------------------------------------------------------------------
+test('migration rolls back when DDL fails inside the migration transaction', async () => {
+  const schemaBroken = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  try {
+    await pool.query(`CREATE SCHEMA "${schemaBroken}"`);
+    await pool.query(`CREATE VIEW "${schemaBroken}".events AS SELECT 1 AS seq`);
+    const { runMigration } = await import('../src/schema.ts');
+
+    await assert.rejects(() => runMigration(pool, schemaBroken, false));
+  } finally {
+    await pool.end();
+    await dropSchema(schemaBroken);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Test 18: flush failure branch when DB access fails while counting pending
+// deliveries.
+// ---------------------------------------------------------------------------
+test('flush surfaces database failures while counting pending deliveries', async () => {
+  const schemaFlushFailure = uniqueSchema();
+  const errorMessages: string[] = [];
+  const ps = makePubSub(schemaFlushFailure, {
+    listen: false,
+    pollIntervalMs: 100,
+    cleanupIntervalMs: 0,
+    logger: makeTestLogger({
+      error: (message: string) => {
+        errorMessages.push(message);
+      },
+    }),
+  });
+
+  const cb: EventCallback = () => undefined;
+  try {
+    await ps.subscribe('topic-flush-db-failure', cb);
+    await ps.publish('topic-flush-db-failure', { type: 'pending', data: null, runId: 'run-flush' });
+    await dropSchema(schemaFlushFailure);
+
+    await assert.rejects(() => ps.flush());
+    assert.ok(errorMessages.includes('flush failed'));
+  } finally {
+    await ps.close().catch(() => undefined);
+    await dropSchema(schemaFlushFailure);
   }
 });

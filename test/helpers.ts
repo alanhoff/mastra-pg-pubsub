@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import type { IMastraLogger } from '@mastra/core/logger';
 import pg from 'pg';
 import type { PostgresPubSubConfig } from '../src/index.ts';
 import { PostgresPubSub } from '../src/index.ts';
@@ -83,6 +84,21 @@ export function makePubSub(
     cleanupIntervalMs: 0,
     ...overrides,
   });
+}
+
+/** Construct a complete Mastra-shaped logger for focused assertions. */
+export function makeTestLogger(overrides: Partial<IMastraLogger> = {}): IMastraLogger {
+  return {
+    debug: () => undefined,
+    info: () => undefined,
+    warn: () => undefined,
+    error: () => undefined,
+    trackException: () => undefined,
+    getTransports: () => new Map(),
+    listLogs: async () => ({ logs: [], total: 0, page: 1, perPage: 100, hasMore: false }),
+    listLogsByRunId: async () => ({ logs: [], total: 0, page: 1, perPage: 100, hasMore: false }),
+    ...overrides,
+  };
 }
 
 /** Resolve after `ms` milliseconds. */
