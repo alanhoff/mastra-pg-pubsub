@@ -1070,7 +1070,9 @@ export class PostgresPubSub extends PubSub {
       span.setAttribute('replayed.count', replayedIndexes.length);
       span.end();
     } catch (error) {
-      await this.unsubscribe(topic, cb).catch((teardownError) => {
+      try {
+        await this.unsubscribe(topic, cb);
+      } catch (teardownError) {
         logWarn(
           this.#logger,
           'failed to clean up replay subscription after setup failure',
@@ -1081,7 +1083,7 @@ export class PostgresPubSub extends PubSub {
           }),
           teardownError,
         );
-      });
+      }
       logError(
         this.#logger,
         'subscribe from offset failed',
