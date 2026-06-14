@@ -109,7 +109,12 @@ function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
     batchSize: integerOption('batchSize', config.batchSize, 32, 1),
     maxEventsPerTopic: integerOption('maxEventsPerTopic', config.maxEventsPerTopic, 10_000, 0),
     cleanupIntervalMs: integerOption('cleanupIntervalMs', config.cleanupIntervalMs, 60_000, 0),
-    staleSubscriptionMs: integerOption('staleSubscriptionMs', config.staleSubscriptionMs, 300_000, 1),
+    staleSubscriptionMs: integerOption(
+      'staleSubscriptionMs',
+      config.staleSubscriptionMs,
+      300_000,
+      1,
+    ),
     listen: config.listen ?? true,
     deadLetter: config.deadLetter ?? false,
     logger,
@@ -643,19 +648,17 @@ export class PostgresPubSub extends PubSub {
     const next = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.#subscriptionLocks.set(
-      key,
-      previous.then(
-        () => next,
-        () => next,
-      ),
+    const current = previous.then(
+      () => next,
+      () => next,
     );
+    this.#subscriptionLocks.set(key, current);
     await previous.catch(() => undefined);
     try {
       return await fn();
     } finally {
       release();
-      if (this.#subscriptionLocks.get(key) === next) {
+      if (this.#subscriptionLocks.get(key) === current) {
         this.#subscriptionLocks.delete(key);
       }
     }
