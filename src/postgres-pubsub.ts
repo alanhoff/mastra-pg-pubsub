@@ -1106,10 +1106,7 @@ export class PostgresPubSub extends PubSub {
       logDebug(this.#logger, 'subscribe from offset completed', context);
       span.setAttribute('replayed.count', replayedIndexes.length);
       span.setAttribute('replay.callback_error_count', replayCallbackErrorCount);
-      span.setAttribute(
-        'replay.callback_status',
-        replayCallbackErrorCount > 0 ? 'error' : 'ok',
-      );
+      span.setAttribute('replay.callback_status', replayCallbackErrorCount > 0 ? 'error' : 'ok');
       span.end();
     } catch (error) {
       try {
