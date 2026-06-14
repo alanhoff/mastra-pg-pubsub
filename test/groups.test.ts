@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import type { Event } from '@mastra/core/events';
-import { dropSchema, makePubSub, uniqueSchema, waitFor } from './helpers.ts';
+import pg from 'pg';
+import { PostgresPubSub } from '../src/index.ts';
+import { DATABASE_URL, dropSchema, makePubSub, makeTestLogger, uniqueSchema, waitFor } from './helpers.ts';
 
 const schema = uniqueSchema();
 const pubsubs: Array<{ close(): Promise<void> }> = [];
@@ -178,4 +180,55 @@ test('group subscription persists across instances: only one receives per event'
 
   assert.equal(received.length, 1);
   assert.equal(received[0], 0);
+});
+
+
+test('concurrent same-group subscribes create one local consume loop', async () => {
+  const concurrentSchema = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  const debugMessages: string[] = [];
+  const ps = new PostgresPubSub({
+    pool,
+    schema: concurrentSchema,
+    listen: false,
+    cleanupIntervalMs: 0,
+    pollIntervalMs: 25,
+    logger: makeTestLogger({
+      debug: (message: string) => {
+        debugMessages.push(message);
+      },
+    }),
+  });
+  pubsubs.push(ps);
+
+  try {
+    await ps.start();
+    const originalQuery = pool.query.bind(pool);
+    let delayedInserts = 0;
+    pool.query = (async (...args: Parameters<typeof pool.query>) => {
+      const sql = String(args[0]);
+      if (sql.includes('INSERT INTO') && sql.includes('."subscriptions"') && delayedInserts < 2) {
+        delayedInserts++;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return await originalQuery(...args);
+    }) as typeof pool.query;
+
+    const cbA = (event: Event, ack?: () => void) => ack?.();
+    const cbB = (event: Event, ack?: () => void) => ack?.();
+    await Promise.all([
+      ps.subscribe('topic-concurrent-group', cbA, { group: 'same-group' }),
+      ps.subscribe('topic-concurrent-group', cbB, { group: 'same-group' }),
+    ]);
+
+    assert.equal(
+      debugMessages.filter((message) => message === 'consume loop started').length,
+      1,
+      'same local group should share one consume loop even under concurrent subscribe calls',
+    );
+  } finally {
+    await ps.close().catch(() => undefined);
+    await pool.end();
+    await dropSchema(concurrentSchema);
+  }
 });

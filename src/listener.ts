@@ -50,7 +50,15 @@ export class NotifyListener {
       this.#handlers.set(topic, set);
     }
     set.add(handler);
-    await this.#ensureConnected();
+    try {
+      await this.#ensureConnected();
+    } catch (error) {
+      set.delete(handler);
+      if (set.size === 0) {
+        this.#handlers.delete(topic);
+      }
+      throw error;
+    }
     const context = traceAttributes({
       channel: this.#channel,
       topic,
@@ -124,6 +132,7 @@ export class NotifyListener {
           'listen connection error',
           traceAttributes({
             channel: this.#channel,
+            errorName: error.name,
           }),
         );
         observeEvent(
