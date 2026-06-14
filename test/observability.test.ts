@@ -310,11 +310,21 @@ test('publish and replay failure telemetry stays sanitized under current-span ob
 
   assert.ok(logs.some((entry) => entry.message === 'publish failed'));
   assert.ok(logs.some((entry) => entry.message === 'replay callback threw'));
+  assert.ok(logs.some((entry) => entry.message === 'subscribe from offset completed'));
   assert.ok(
     root.record.children.some(
       (child) =>
         child.record.name === 'pg_pubsub.publish' &&
         child.record.attributes.status === 'error' &&
+        child.record.ended,
+    ),
+  );
+  assert.ok(
+    root.record.children.some(
+      (child) =>
+        child.record.name === 'pg_pubsub.subscribe_from_offset' &&
+        child.record.attributes['replay.callback_error_count'] === 1 &&
+        child.record.attributes['replay.callback_status'] === 'error' &&
         child.record.ended,
     ),
   );

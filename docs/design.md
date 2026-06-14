@@ -34,7 +34,7 @@ deliveries     event_seq BIGINT FK->events, subscription_id TEXT FK->subscriptio
 dead_events    optional copy of event + subscription + attempts when deadLetter is true
 ```
 
-PostgreSQL reserves the `pg_` prefix. The adapter always runs its idempotent migration during first database use. Production deployments should run `pubsub.migrate()` during deploy with the same package version to fail fast, and pre-create `pg_pubsub` with an admin/migration role when using the default schema. Runtime roles still need `USAGE, CREATE` on the adapter schema so `CREATE TABLE/INDEX IF NOT EXISTS` can run, plus DML privileges on adapter tables/sequences and `LISTEN/NOTIFY` access. Other custom `pg_` names are rejected; users can select an ordinary schema name when their database policy requires one.
+PostgreSQL reserves the `pg_` prefix. When the default schema is absent, the migration enables the session flag needed to create this package-owned schema; when the schema already exists, ordinary roles only need table-creation privileges inside it. Other custom `pg_` names are rejected; users can select an ordinary schema name when their database policy requires one. Production least-privilege deployments should run `migrate()` from a release/migration role and run app workers with DML privileges on the pre-created schema rather than broad runtime DDL privileges.
 
 ## Data Flow
 
@@ -133,4 +133,6 @@ Emitted context is allow-listed scalar metadata such as topic, event id/type/ind
 - Lint/format: Biome.
 - Postgres for dev/test via Docker Compose.
 - Cluster tests prove fan-out, consumer groups, and history across child-process Mastra instances.
-- CI runs `npm run test:cluster` and `npm run test:e2e:semantics` without `OPENAI_API_KEY`; only `npm run test:e2e:mastra` is skipped when the secret is absent.
+- E2E tests are split into key-free PubSub semantics (`test:e2e:semantics`) and OpenAI-backed Mastra stream coverage (`test:e2e:mastra`, gated by `OPENAI_API_KEY`).
+- Package contents intentionally exclude source maps because TypeScript sources are not published.
+- Telemetry allow-lists scalar operational metadata; applications should not encode tenant/user/secret values in channel, group, topic, run, or subscription identifiers unless their telemetry backend is approved for those identifiers.
