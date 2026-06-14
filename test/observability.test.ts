@@ -210,6 +210,40 @@ test('observability spans and events are created from the current Mastra span', 
   assert.equal(root.record.events[0]?.name, 'pg_pubsub.test_event');
 });
 
+test('observability span run isolates executeWithContext failures from callbacks', async () => {
+  const root = makeFakeSpan('root-context-failure');
+  setCurrentSpanResolver(() => root.span);
+
+  let setupFallbackCalls = 0;
+  setExecuteWithContext(async () => {
+    throw new Error('context setup failed');
+  });
+  const setupSpan = startObservabilitySpan('pg_pubsub.context_setup_failure');
+  const setupResult = await setupSpan.run(async () => {
+    setupFallbackCalls++;
+    return 'setup-fallback-result';
+  });
+  setupSpan.end();
+
+  assert.equal(setupResult, 'setup-fallback-result');
+  assert.equal(setupFallbackCalls, 1, 'callback should run once through setup-failure fallback');
+
+  let teardownCalls = 0;
+  setExecuteWithContext(async ({ fn }) => {
+    await fn();
+    throw new Error('context teardown failed');
+  });
+  const teardownSpan = startObservabilitySpan('pg_pubsub.context_teardown_failure');
+  const teardownResult = await teardownSpan.run(async () => {
+    teardownCalls++;
+    return 'teardown-result';
+  });
+  teardownSpan.end();
+
+  assert.equal(teardownResult, 'teardown-result');
+  assert.equal(teardownCalls, 1, 'callback should not be replayed after teardown failure');
+});
+
 test('observability helpers tolerate missing, throwing, and duplicate-end paths', async () => {
   const logs: LogEntry[] = [];
   const logger = makeCaptureLogger(logs);

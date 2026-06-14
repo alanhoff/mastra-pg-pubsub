@@ -121,32 +121,6 @@ function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
   };
 }
 
-function positiveInteger(value: number, option: string): number {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`${option} must be a positive safe integer`);
-  }
-  return value;
-}
-
-function nonNegativeInteger(value: number, option: string): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`${option} must be a non-negative safe integer`);
-  }
-  return value;
-}
-
-function maxDeliveryAttemptLimit(value: number): number {
-  if (value === Number.POSITIVE_INFINITY) {
-    return value;
-  }
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(
-      'maxDeliveryAttempts must be a positive safe integer, Infinity, or 0 for Infinity',
-    );
-  }
-  return value;
-}
-
 /**
  * A PostgreSQL-backed {@link PubSub} implementation for Mastra.
  *
