@@ -36,6 +36,8 @@ dead_events    optional copy of event + subscription + attempts when deadLetter 
 
 PostgreSQL reserves the `pg_` prefix. When the default schema is absent, the migration enables the session flag needed to create this package-owned schema; when the schema already exists, ordinary roles only need table-creation privileges inside it. Other custom `pg_` names are rejected; users can select an ordinary schema name when their database policy requires one. Production least-privilege deployments should run `migrate()` from a release/migration role and run app workers with DML privileges on the pre-created schema rather than broad runtime DDL privileges.
 
+Production deployments should separate migration and runtime privilege when possible: a deploy-time migration role runs `migrate()` or equivalent SQL, while the long-lived application role only needs DML privileges on the package tables. Runtime auto-migration remains a convenience path for development and simple deployments, not a requirement to grant DDL privileges to every application process.
+
 ## Data Flow
 
 ```mermaid
@@ -72,7 +74,7 @@ Subscribers created after publish do not receive prior events, but can get them 
 - `publish`, `subscribe`, `getHistory`, `subscribeWithReplay`, `subscribeFromOffset`, `start`, `init`, and `migrate` start lazily when they need the database.
 - Startup migrates the schema once and starts maintenance when `cleanupIntervalMs > 0`.
 - Unsubscribing stops the consume loop for that subscription. When no local subscriptions remain, the adapter closes the listener, clears the maintenance timer, and resets start state so future database use restarts lazily.
-- `flush()` drains in-flight publishes and delivery rows for this instance's active subscription ids. Private ids are local to the process; group ids are shared, so group flush is intentionally group-wide for the `(topic, group)` subscription.
+- `flush()` drains in-flight publishes and deliveries for this adapter's active subscription ids. Private subscription ids are local to one process; group subscription ids are shared across group members, so group `flush()` is a group-wide drain check rather than a strictly process-local check.
 - `close()` is terminal and idempotent. It stops loops, releases the listener, deletes private subscriptions, and ends only pools created by this library.
 
 ## Replay
@@ -112,7 +114,7 @@ The adapter emits payload-safe logs plus Mastra observability spans/events:
 - Operation spans are created as generic child spans of the current span when one exists.
 - Delivery callbacks run inside the delivery span context so downstream work inherits the correct async context.
 
-Emitted context is allow-listed scalar metadata such as topic, event id/type/index, run id, subscription id/kind, attempts, counts, status, and duration. Event payload `data`, connection strings, raw database rows, secrets, and arbitrary user objects are excluded. Topic, group, run id, and subscription values are still operator-visible metadata, so applications should avoid embedding sensitive tenant/user identifiers in them or should hash/pseudonymize those identifiers before publishing/subscribing. Errors are sanitized to fields such as `error.name`.
+Emitted context is allow-listed scalar metadata such as topic, event id/type/index, run id, subscription id/kind, attempts, counts, status, and duration. Event payload `data`, connection strings, raw database rows, secrets, and arbitrary user objects are excluded. Errors are sanitized to fields such as `error.name`. Applications that encode tenant, user, or business-sensitive values in topics, groups, run ids, or other identifiers should hash or redact those identifiers before handing them to PubSub.
 
 ## Delivery Guarantees
 
@@ -133,6 +135,4 @@ Emitted context is allow-listed scalar metadata such as topic, event id/type/ind
 - Lint/format: Biome.
 - Postgres for dev/test via Docker Compose.
 - Cluster tests prove fan-out, consumer groups, and history across child-process Mastra instances.
-- E2E tests are split into key-free PubSub semantics (`test:e2e:semantics`) and OpenAI-backed Mastra stream coverage (`test:e2e:mastra`, gated by `OPENAI_API_KEY`).
-- Package contents intentionally exclude source maps because TypeScript sources are not published.
-- Telemetry allow-lists scalar operational metadata; applications should not encode tenant/user/secret values in channel, group, topic, run, or subscription identifiers unless their telemetry backend is approved for those identifiers.
+- E2E tests prove key-free PubSub semantics against live Postgres on every CI run; the OpenAI-backed Mastra durable-agent case is gated by `OPENAI_API_KEY`.

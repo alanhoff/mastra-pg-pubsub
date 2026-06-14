@@ -51,7 +51,7 @@
     "test:coverage": "node --test --test-concurrency=1 --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-lines=95 --test-coverage-functions=95 --test-coverage-branches=90 'test/*.test.ts'",
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down -v",
-    "test:e2e": "npm run test:e2e:semantics && npm run test:e2e:mastra",
+    "test:e2e": "node --env-file-if-exists=.env --test 'test/e2e/*.test.ts'",
     "test:e2e:semantics": "node --env-file-if-exists=.env --test test/e2e/semantics.e2e.test.ts",
     "test:e2e:mastra": "node --env-file-if-exists=.env --test test/e2e/mastra-integration.e2e.test.ts"
   },

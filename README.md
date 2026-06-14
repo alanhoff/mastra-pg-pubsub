@@ -123,6 +123,8 @@ The adapter always runs its idempotent migration during first database use. For 
 
 Production deployments that separate DDL from runtime traffic should run `await pubsub.migrate()` from a release/migration job using a database role allowed to create the configured schema, tables, and indexes. The application runtime role can then reuse the same `schema` with ordinary DML privileges on the created objects; it does not need to own the database or create arbitrary schemas during request handling. If your policy forbids the default `pg_pubsub` schema bootstrap, configure an ordinary schema name such as `app_pubsub` and pre-create it with your migration role before starting app workers.
 
+For least-privilege production deployments, run `await pubsub.migrate()` during a controlled deploy step with a migration role, then run the application with a narrower runtime role that can read/write the package tables but does not need schema/table DDL privileges. If runtime DDL is not acceptable in your environment, pre-create the schema/tables with the migration role before application startup instead of relying on the app role to perform first-use migration.
+
 ## Lifecycle
 
 No lifecycle wiring is required. Any method that touches the database starts the adapter lazily by running the migration and starting maintenance if enabled:
@@ -136,7 +138,7 @@ No lifecycle wiring is required. Any method that touches the database starts the
 
 When the last local subscriber is removed, the adapter stops idle resources: consume loops are stopped as part of unsubscribe, the `LISTEN` connection is closed, and the maintenance timer is cleared. The pool stays open so later database use can restart lazily. `close()` remains the explicit terminal cleanup path and ends only pools created by this library.
 
-`flush()` resolves when all in-flight publishes and database deliveries for this instance's active subscription ids settle. For private subscribers those ids are local to the process. For consumer groups, the subscription id is intentionally shared across group members, so `flush()` is a group-wide drain for that `(topic, group)` rather than a strictly local-process drain. Callback errors are logged, never thrown. If matching deliveries remain unsettled after the bounded drain window, `flush()` rejects so callers do not mistake a stuck subscriber or group member for a clean drain.
+`flush()` resolves when all in-flight publishes and deliveries for this adapter's active subscription ids settle. For private subscribers those ids are local to the process. For consumer groups the subscription id is shared by every process in the group, so `flush()` is intentionally a group-wide drain check and can wait on work claimed by another group member. Callback errors are logged, never thrown. If matching deliveries remain unsettled after the bounded drain window, `flush()` rejects so callers do not mistake stuck work for a clean drain.
 
 ## Observability
 
@@ -149,7 +151,7 @@ const span = resolveCurrentSpan();
 const observability = span?.observabilityInstance;
 ```
 
-Emitted context is allow-listed scalar metadata: topics, event ids, event types, indexes, run ids, subscription ids/kinds, attempts, counts, status, and durations. Event `data`, connection strings, raw database rows, and arbitrary payload objects are not logged or attached to spans. Error telemetry is sanitized to metadata such as `error.name`. Treat channel, group, topic, run, and subscription identifiers as operational metadata that may appear in logs, traces, and metrics; avoid embedding tenant, user, or secret values in those identifiers unless your telemetry backend is approved for them.
+Emitted context is allow-listed scalar metadata: topics, event ids, event types, indexes, run ids, subscription ids/kinds, attempts, counts, status, and durations. Event `data`, connection strings, raw database rows, and arbitrary payload objects are not logged or attached to spans. Error telemetry is sanitized to metadata such as `error.name`. Treat topic, group, run, and subscription identifiers as operational metadata: if your application embeds tenant, user, or business-sensitive values in those identifiers, hash or redact them before passing them to PubSub.
 
 Span and event names use the `pg_pubsub.*` prefix, including `pg_pubsub.lifecycle.start`, `pg_pubsub.lifecycle.idle_stop`, `pg_pubsub.migrate`, `pg_pubsub.publish`, `pg_pubsub.delivery`, `pg_pubsub.flush`, `pg_pubsub.listener.*`, and `pg_pubsub.maintenance.*`.
 
@@ -188,6 +190,7 @@ npm install
 npm run db:up
 npm test
 npm run test:cluster
+npm run test:e2e:semantics
 npm run test:coverage
 npm run typecheck
 npm run lint
@@ -198,17 +201,16 @@ npm run build
 
 ### Real E2E Tests
 
-The e2e suite has two lanes: key-free database PubSub semantics and an OpenAI-backed Mastra durable-agent stream with Postgres memory. The real agent test intentionally validates the durable-agent stream API and topic shape for the locked `@mastra/core` version; refresh it when upgrading Mastra.
+The e2e suite includes key-free delivery semantics tests plus one real Mastra durable-agent stream backed by OpenAI and Postgres memory. CI always runs `npm run test:e2e:semantics`; the OpenAI-backed test runs only when `OPENAI_API_KEY` is configured. The real agent test intentionally validates the durable-agent stream API and topic shape for the locked `@mastra/core` version; refresh it when upgrading Mastra.
 
 ```sh
 npm run db:up
-npm run test:e2e:semantics # key-free PubSub semantics
-OPENAI_API_KEY=... npm run test:e2e:mastra # optional OpenAI-backed Mastra stream
-npm run test:e2e # runs both scripts, so it requires OPENAI_API_KEY
+npm run test:e2e:semantics
+npm run test:e2e:mastra
 ```
 
 The scripts load `.env` when present with Node's `--env-file-if-exists=.env`, so an exported `OPENAI_API_KEY` also works. CI always runs the key-free semantics e2e suite and runs the OpenAI-backed Mastra stream only when the secret is configured. Keep `.env` out of git.
 
 ## Package Contents
 
-`npm pack --dry-run` should include only built `dist/**/*.js` and `dist/**/*.d.ts` files plus package metadata, README, changelog, and license. TypeScript sources, tests, local notes, `.env`, declaration maps, and JavaScript source maps are not published; source-map files are excluded because the source files are intentionally excluded from the package.
+`npm pack --dry-run` should include only the built `dist/` files plus package metadata, README, changelog, and license. Source, tests, local notes, and `.env` are not published. The package intentionally publishes build output only; keep source-map/package-content policy aligned when changing `tsconfig.build.json` or the `files` list.

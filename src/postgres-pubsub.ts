@@ -1265,14 +1265,25 @@ export class PostgresPubSub extends PubSub {
     return result.rowCount ?? 0;
   }
 
-  async #stopSubscriptionsForClose(): Promise<void> {
+  #clearMaintenanceTimer(): void {
+    if (this.#maintenanceTimer) {
+      clearInterval(this.#maintenanceTimer);
+      this.#maintenanceTimer = undefined;
+    }
+  }
+
+  async #settlePendingPublishes(): Promise<void> {
+    await Promise.allSettled([...this.#pendingPublishes]);
+  }
+
+  async #stopSubscriptionLoops(): Promise<void> {
     for (const sub of this.#subscriptions.values()) {
       sub.unregisterWake?.();
     }
-    await Promise.all([...this.#subscriptions.values()].map((s) => s.loop.stop()));
+    await Promise.all([...this.#subscriptions.values()].map((sub) => sub.loop.stop()));
   }
 
-  async #closeListenerForClose(): Promise<void> {
+  async #closeListener(): Promise<void> {
     if (!this.#listener) {
       return;
     }
@@ -1280,16 +1291,17 @@ export class PostgresPubSub extends PubSub {
     this.#listener = undefined;
   }
 
-  async #clearSubscriptions(): Promise<string[]> {
-    const privateIds = [...this.#subscriptions.values()].filter((s) => !s.isGroup).map((s) => s.id);
-    this.#subscriptions.clear();
-    if (privateIds.length > 0) {
-      try {
-        await this.#pool.query(
-          `DELETE FROM ${this.#q('subscriptions')} WHERE id = ANY($1::text[])`,
-          [privateIds],
-        );
-      } catch (error) {
+  #privateSubscriptionIds(): string[] {
+    return [...this.#subscriptions.values()].filter((sub) => !sub.isGroup).map((sub) => sub.id);
+  }
+
+  async #deletePrivateSubscriptions(privateIds: string[]): Promise<void> {
+    if (privateIds.length === 0) {
+      return;
+    }
+    await this.#pool
+      .query(`DELETE FROM ${this.#q('subscriptions')} WHERE id = ANY($1::text[])`, [privateIds])
+      .catch((error) =>
         logWarn(
           this.#logger,
           'failed to delete private subscriptions',
@@ -1297,10 +1309,14 @@ export class PostgresPubSub extends PubSub {
             privateSubscriptionCount: privateIds.length,
           }),
           error,
-        );
-      }
+        ),
+      );
+  }
+
+  async #closeOwnedPool(): Promise<void> {
+    if (this.#ownsPool) {
+      await this.#pool.end();
     }
-    return privateIds;
   }
 
   /**
@@ -1332,20 +1348,16 @@ export class PostgresPubSub extends PubSub {
     try {
       this.#closed = true;
 
-      if (this.#maintenanceTimer) {
-        clearInterval(this.#maintenanceTimer);
-        this.#maintenanceTimer = undefined;
-      }
+      this.#clearMaintenanceTimer();
+      await this.#settlePendingPublishes();
+      await this.#stopSubscriptionLoops();
+      await this.#closeListener();
 
-      await Promise.allSettled([...this.#pendingPublishes]);
+      const privateIds = this.#privateSubscriptionIds();
+      this.#subscriptions.clear();
+      await this.#deletePrivateSubscriptions(privateIds);
+      await this.#closeOwnedPool();
 
-      await this.#stopSubscriptionsForClose();
-      await this.#closeListenerForClose();
-
-      const privateIds = await this.#clearSubscriptions();
-      if (this.#ownsPool) {
-        await this.#pool.end();
-      }
       const context = traceAttributes({
         schema: this.#config.schema,
         ownsPool: this.#ownsPool,
