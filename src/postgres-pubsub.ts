@@ -5,6 +5,7 @@ import pg from 'pg';
 import { type CallbackRegistry, ConsumeLoop } from './consume-loop.ts';
 import { NotifyListener } from './listener.ts';
 import {
+  type ActiveObservabilitySpan,
   logDebug,
   logError,
   logWarn,
@@ -264,28 +265,8 @@ export class PostgresPubSub extends PubSub {
         if (this.#closed) {
           throw new Error('PostgresPubSub is closed');
         }
-        if (!this.#started) {
-          logDebug(
-            this.#logger,
-            'postgres pubsub start started',
-            traceAttributes({
-              schema: this.#config.schema,
-            }),
-          );
-          const start = this.#start();
-          this.#started = start;
-        } else {
-          span.setAttribute('lifecycle.start.cached', true);
-        }
-        const start = this.#started;
-        try {
-          await start;
-        } catch (error) {
-          if (this.#started === start) {
-            this.#started = undefined;
-          }
-          throw error;
-        }
+        const start = this.#getStartPromise(span);
+        await this.#awaitStartPromise(start);
       });
       logDebug(
         this.#logger,
@@ -310,6 +291,34 @@ export class PostgresPubSub extends PubSub {
   /** Alias for hosts that look for a generic async init hook. */
   async init(): Promise<void> {
     await this.start();
+  }
+
+  #getStartPromise(span: ActiveObservabilitySpan): Promise<void> {
+    if (this.#started) {
+      span.setAttribute('lifecycle.start.cached', true);
+      return this.#started;
+    }
+    logDebug(
+      this.#logger,
+      'postgres pubsub start started',
+      traceAttributes({
+        schema: this.#config.schema,
+      }),
+    );
+    const start = this.#start();
+    this.#started = start;
+    return start;
+  }
+
+  async #awaitStartPromise(start: Promise<void>): Promise<void> {
+    try {
+      await start;
+    } catch (error) {
+      if (this.#started === start) {
+        this.#started = undefined;
+      }
+      throw error;
+    }
   }
 
   async #start(): Promise<void> {
@@ -1226,6 +1235,21 @@ export class PostgresPubSub extends PubSub {
     return result.rowCount ?? 0;
   }
 
+  async #stopSubscriptionsForClose(): Promise<void> {
+    for (const sub of this.#subscriptions.values()) {
+      sub.unregisterWake?.();
+    }
+    await Promise.all([...this.#subscriptions.values()].map((s) => s.loop.stop()));
+  }
+
+  async #closeListenerForClose(): Promise<void> {
+    if (!this.#listener) {
+      return;
+    }
+    await this.#listener.close();
+    this.#listener = undefined;
+  }
+
   async #clearSubscriptions(): Promise<string[]> {
     const privateIds = [...this.#subscriptions.values()].filter((s) => !s.isGroup).map((s) => s.id);
     this.#subscriptions.clear();
@@ -1285,15 +1309,8 @@ export class PostgresPubSub extends PubSub {
 
       await Promise.allSettled([...this.#pendingPublishes]);
 
-      for (const sub of this.#subscriptions.values()) {
-        sub.unregisterWake?.();
-      }
-      await Promise.all([...this.#subscriptions.values()].map((s) => s.loop.stop()));
-
-      if (this.#listener) {
-        await this.#listener.close();
-        this.#listener = undefined;
-      }
+      await this.#stopSubscriptionsForClose();
+      await this.#closeListenerForClose();
 
       const privateIds = await this.#clearSubscriptions();
       if (this.#ownsPool) {

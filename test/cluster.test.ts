@@ -128,7 +128,8 @@ class ClusterWorker {
       if (this.#child.connected) {
         await this.#send({ type: 'close' }, 5_000);
       }
-    } catch {
+    } catch (error) {
+      void error;
       // Teardown should still kill the child and continue cleaning the schema.
     } finally {
       if (this.#child.exitCode === null && this.#child.signalCode === null) {

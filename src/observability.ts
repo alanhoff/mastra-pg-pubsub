@@ -167,7 +167,8 @@ function currentSpan(): AnySpan | undefined {
 function safeCall(fn: () => void): void {
   try {
     fn();
-  } catch {
+  } catch (error) {
+    void error;
     // Observability must never change PubSub behavior.
   }
 }

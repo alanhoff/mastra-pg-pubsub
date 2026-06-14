@@ -117,7 +117,7 @@ Provide exactly one of `connectionString` or `pool`.
 | `deadLetter` | `false` | Copy exhausted events to `dead_events`. |
 | `logger` | current span logger | Same logger shape accepted by `new Mastra({ logger })`. Pass `false` to force silence. |
 
-The default schema is created automatically during migration when it is missing. PostgreSQL reserves the `pg_` prefix, so first-time creation of `pg_pubsub` requires an elevated migration role allowed to set `allow_system_table_mods`; once the schema exists, ordinary roles only need table-creation privileges on that schema. For least-privilege production deployments, run `await pubsub.migrate()` from a migration/admin role during deploy, then run the application with a role that has DML privileges on the adapter tables plus `USAGE` on the schema and `LISTEN/NOTIFY` access. Use `schema` when your database policy requires an ordinary application schema name.
+The adapter always runs its idempotent migration during first database use. For production, run `await pubsub.migrate()` during deploy with the same package version to fail fast, and pre-create `pg_pubsub` with an admin/migration role when using the default schema. Runtime roles still need `USAGE, CREATE` on the adapter schema so `CREATE TABLE/INDEX IF NOT EXISTS` can run, plus DML privileges on adapter tables/sequences and `LISTEN/NOTIFY` access. Use `schema` when your database policy requires an ordinary application schema name.
 
 ## Lifecycle
 
@@ -145,7 +145,7 @@ const span = resolveCurrentSpan();
 const observability = span?.observabilityInstance;
 ```
 
-Emitted context is allow-listed scalar metadata: topics, event ids, event types, indexes, run ids, subscription ids/kinds, attempts, counts, status, and durations. Event `data`, connection strings, raw database rows, and arbitrary payload objects are not logged or attached to spans. Error telemetry is sanitized to metadata such as `error.name`. Treat topic, group, run, and subscription identifiers as operational metadata: if your application encodes tenant, user, or business-sensitive values in those identifiers, hash or pseudonymize them before passing them to PubSub. Treat topic, group, run id, and subscription identifiers as operational metadata: if those values contain tenant, user, or business identifiers, they can appear in logs/traces and should be hashed or pseudonymized by the application before calling PubSub.
+Emitted context is allow-listed scalar metadata: topics, event ids, event types, indexes, run ids, subscription ids/kinds, attempts, counts, status, and durations. Event `data`, connection strings, raw database rows, and arbitrary payload objects are not logged or attached to spans. Error telemetry is sanitized to metadata such as `error.name`. Treat topic, group, run id, and subscription identifiers as operational metadata: if those values contain tenant, user, or business identifiers, they can appear in logs/traces and should be hashed or pseudonymized by the application before calling PubSub.
 
 Span and event names use the `pg_pubsub.*` prefix, including `pg_pubsub.lifecycle.start`, `pg_pubsub.lifecycle.idle_stop`, `pg_pubsub.migrate`, `pg_pubsub.publish`, `pg_pubsub.delivery`, `pg_pubsub.flush`, `pg_pubsub.listener.*`, and `pg_pubsub.maintenance.*`.
 
@@ -190,7 +190,7 @@ npm run lint
 npm run build
 ```
 
-`npm test` and `npm run test:e2e:semantics` are key-free and use the pinned Postgres service from `docker-compose.yml` on port `5544`. `npm run test:cluster` runs the process-level cluster proof: multiple child Node processes each create a real `Mastra` container with this adapter, then verify fan-out, competing-consumer groups, and history through the shared Postgres schema. CI runs the cluster proof and the key-free e2e semantics on every PR.
+`npm test` and `npm run test:e2e:semantics` are key-free and use the pinned Postgres service from `docker-compose.yml` on port `5544`. `npm run test:cluster` runs the process-level cluster proof: multiple child Node processes each create a real `Mastra` container with this adapter, then verify fan-out, competing-consumer groups, and history through the shared Postgres schema. CI runs `npm run test:cluster` and `npm run test:e2e:semantics` without `OPENAI_API_KEY`; only `npm run test:e2e:mastra` is skipped when the secret is absent.
 
 ### Real E2E Tests
 
@@ -206,4 +206,4 @@ OPENAI_API_KEY=... npm run test:e2e:mastra # or put the key in .env
 
 ## Package Contents
 
-`npm pack --dry-run` should include only built JavaScript/declaration files from `dist/` plus package metadata, README, changelog, and license. Source, tests, source maps, local notes, and `.env` are not published; build output disables source maps to keep the package contents aligned with that policy.
+`npm pack --dry-run` should include only the built `dist/` JavaScript/declaration files plus package metadata, README, changelog, and license. Build-time source maps and declaration maps are disabled, so the package does not publish maps that point at unpublished `src/` files. Source, tests, local notes, and `.env` are not published.

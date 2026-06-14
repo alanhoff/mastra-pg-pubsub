@@ -221,8 +221,13 @@ export class NotifyListener {
       client.removeAllListeners('error');
       try {
         await client.query(`UNLISTEN ${quoteIdentifier(this.#channel)}`);
-      } catch {
-        // best effort; releasing the client drops the listen anyway
+      } catch (error) {
+        logWarn(
+          this.#logger,
+          'listen unlisten failed during close',
+          traceAttributes({ channel: this.#channel }),
+          error,
+        );
       }
       client.release();
     }

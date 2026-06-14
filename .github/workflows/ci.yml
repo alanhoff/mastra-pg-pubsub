@@ -49,7 +49,7 @@ jobs:
       - run: npm pack --dry-run
 
   e2e:
-    name: E2E
+    name: Key-free + Mastra e2e
     runs-on: ubuntu-latest
     needs: verify
     services:
