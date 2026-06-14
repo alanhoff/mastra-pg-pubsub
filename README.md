@@ -127,6 +127,8 @@ For least-privilege production deployments, run `await pubsub.migrate()` during 
 
 For least-privilege production deployments, run `await pubsub.migrate()` during a controlled deploy step with a migration role, then run the application with a narrower runtime role that can read/write the package tables but does not need schema/table DDL privileges. If runtime DDL is not acceptable in your environment, pre-create the schema/tables with the migration role before application startup instead of relying on the app role to perform first-use migration.
 
+For least-privilege production deployments, run `await pubsub.migrate()` during a controlled deploy step with a migration role, then run the application with a narrower runtime role that can read/write the package tables but does not need schema/table DDL privileges. If runtime DDL is not acceptable in your environment, pre-create the schema/tables with the migration role before application startup instead of relying on the app role to perform first-use migration.
+
 ## Lifecycle
 
 No lifecycle wiring is required. Any method that touches the database starts the adapter lazily by running the migration and starting maintenance if enabled:
