@@ -326,10 +326,10 @@ test('subscribe rolls back private state when listen setup fails', async () => {
   let connectCalls = 0;
   pool.connect = (async (...args: []) => {
     connectCalls++;
-    if (connectCalls === 1) {
-      return originalConnect(...args);
+    if (connectCalls === 2) {
+      throw new Error('listen connect failed');
     }
-    throw new Error('listen connect failed');
+    return originalConnect(...args);
   }) as typeof pool.connect;
 
   try {
