@@ -57,13 +57,25 @@ function groupSubscriptionId(topic: string, group: string): string {
   return `__group:${hashPart(topic)}:${hashPart(group)}`;
 }
 
-function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
-  const logger = config.logger;
-  const schema = config.schema ?? DEFAULT_SCHEMA;
-  assertValidSchema(schema);
+function integerOption(
+  name: keyof PostgresPubSubConfig,
+  value: number | undefined,
+  defaultValue: number,
+  minimum: number,
+): number {
+  const resolved = value ?? defaultValue;
+  if (!Number.isSafeInteger(resolved) || resolved < minimum) {
+    throw new Error(`${String(name)} must be a safe integer >= ${minimum}`);
+  }
+  return resolved;
+}
 
-  let maxDeliveryAttempts = config.maxDeliveryAttempts ?? 5;
-  if (maxDeliveryAttempts === 0) {
+function maxDeliveryAttemptsOption(
+  value: PostgresPubSubConfig['maxDeliveryAttempts'],
+  logger: PostgresPubSubConfig['logger'],
+): number {
+  const resolved = value ?? 5;
+  if (resolved === 0) {
     logWarn(
       logger,
       'maxDeliveryAttempts=0 is treated as Infinity (unbounded redelivery)',
@@ -72,22 +84,32 @@ function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
         resolvedMaxDeliveryAttempts: 'Infinity',
       }),
     );
-    maxDeliveryAttempts = Number.POSITIVE_INFINITY;
+    return Number.POSITIVE_INFINITY;
   }
+  if (resolved === Number.POSITIVE_INFINITY) {
+    return resolved;
+  }
+  if (!Number.isSafeInteger(resolved) || resolved < 1) {
+    throw new Error('maxDeliveryAttempts must be a positive safe integer, Infinity, or 0');
+  }
+  return resolved;
+}
+
+function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
+  const logger = config.logger;
+  const schema = config.schema ?? DEFAULT_SCHEMA;
+  assertValidSchema(schema);
 
   return {
     schema,
-    pollIntervalMs: positiveInteger(config.pollIntervalMs ?? 1000, 'pollIntervalMs'),
-    ackDeadlineMs: positiveInteger(config.ackDeadlineMs ?? 30_000, 'ackDeadlineMs'),
-    nackDelayMs: nonNegativeInteger(config.nackDelayMs ?? 0, 'nackDelayMs'),
-    maxDeliveryAttempts: maxDeliveryAttemptLimit(maxDeliveryAttempts),
-    batchSize: positiveInteger(config.batchSize ?? 32, 'batchSize'),
-    maxEventsPerTopic: nonNegativeInteger(config.maxEventsPerTopic ?? 10_000, 'maxEventsPerTopic'),
-    cleanupIntervalMs: nonNegativeInteger(config.cleanupIntervalMs ?? 60_000, 'cleanupIntervalMs'),
-    staleSubscriptionMs: positiveInteger(
-      config.staleSubscriptionMs ?? 300_000,
-      'staleSubscriptionMs',
-    ),
+    pollIntervalMs: integerOption('pollIntervalMs', config.pollIntervalMs, 1000, 1),
+    ackDeadlineMs: integerOption('ackDeadlineMs', config.ackDeadlineMs, 30_000, 1),
+    nackDelayMs: integerOption('nackDelayMs', config.nackDelayMs, 0, 0),
+    maxDeliveryAttempts: maxDeliveryAttemptsOption(config.maxDeliveryAttempts, logger),
+    batchSize: integerOption('batchSize', config.batchSize, 32, 1),
+    maxEventsPerTopic: integerOption('maxEventsPerTopic', config.maxEventsPerTopic, 10_000, 0),
+    cleanupIntervalMs: integerOption('cleanupIntervalMs', config.cleanupIntervalMs, 60_000, 0),
+    staleSubscriptionMs: integerOption('staleSubscriptionMs', config.staleSubscriptionMs, 300_000, 1),
     listen: config.listen ?? true,
     deadLetter: config.deadLetter ?? false,
     logger,
@@ -242,6 +264,9 @@ export class PostgresPubSub extends PubSub {
         this.#migrated = undefined;
       }
       span.recordError(error);
+      if (this.#migrated) {
+        this.#migrated = undefined;
+      }
       span.end({ code: 'error', message: 'migration failed' });
       throw error;
     }
@@ -282,6 +307,7 @@ export class PostgresPubSub extends PubSub {
           ? 'postgres pubsub start skipped for closed pubsub'
           : 'postgres pubsub start failed';
       logError(this.#logger, message, traceAttributes({ schema: this.#config.schema }), error);
+      this.#started = undefined;
       span.recordError(error);
       span.end({ code: 'error', message: 'pubsub start failed' });
       throw error;
@@ -530,14 +556,15 @@ export class PostgresPubSub extends PubSub {
       }),
     );
     let created = false;
+    let sub: Subscription | undefined;
     const subscriptionId = group
       ? groupSubscriptionId(topic, group)
       : `__private:${this.#instanceId}:${randomUUID()}`;
+    const key = mapKey(topic, subscriptionId);
     try {
       await this.#ensureReady();
-      const key = mapKey(topic, subscriptionId);
-      return await this.#serializeSubscriptionSetup(key, async () => {
-        let sub = this.#subscriptions.get(key);
+      return await this.#withSubscriptionLock(key, async () => {
+        sub = this.#subscriptions.get(key);
         if (!sub) {
           const isGroup = group !== undefined;
           await this.#upsertSubscription(subscriptionId, topic, isGroup);
@@ -564,32 +591,16 @@ export class PostgresPubSub extends PubSub {
           created = true;
         }
 
-        try {
-          if (startImmediately) {
-            await this.#startSubscription(sub);
-          }
-          this.#addCallbackRegistration(userKey, sub, registered);
-          if (startImmediately) {
-            sub.loop.wake();
-          }
-        } catch (error) {
-          if (created) {
-            try {
-              await this.#rollbackCreatedSubscription(sub);
-            } catch (rollbackError) {
-              logWarn(
-                this.#logger,
-                'failed to roll back subscription after setup failure',
-                traceAttributes({
-                  topic,
-                  subscriptionId,
-                  subscriptionKind,
-                }),
-                rollbackError,
-              );
-            }
-          }
-          throw error;
+        sub.registry.callbacks.push(registered);
+        let registrations = this.#cbIndex.get(userKey);
+        if (!registrations) {
+          registrations = [];
+          this.#cbIndex.set(userKey, registrations);
+        }
+        registrations.push({ sub, registered });
+        if (startImmediately) {
+          await this.#startSubscription(sub);
+          sub.loop.wake();
         }
         const context = traceAttributes({
           topic,
@@ -617,54 +628,64 @@ export class PostgresPubSub extends PubSub {
         }),
         error,
       );
+      if (sub) {
+        await this.#rollbackRegistration(sub, userKey, registered, created);
+      }
       span.recordError(error);
       span.end({ code: 'error', message: 'subscription registration failed' });
       throw error;
     }
   }
 
-  async #serializeSubscriptionSetup<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  async #withSubscriptionLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.#subscriptionLocks.get(key) ?? Promise.resolve();
     let release!: () => void;
     const next = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const lock = previous.then(
-      () => next,
-      () => next,
+    this.#subscriptionLocks.set(
+      key,
+      previous.then(
+        () => next,
+        () => next,
+      ),
     );
-    this.#subscriptionLocks.set(key, lock);
     await previous.catch(() => undefined);
     try {
       return await fn();
     } finally {
       release();
-      if (this.#subscriptionLocks.get(key) === lock) {
+      if (this.#subscriptionLocks.get(key) === next) {
         this.#subscriptionLocks.delete(key);
       }
     }
   }
 
-  #addCallbackRegistration(
-    userKey: EventCallback,
+  async #rollbackRegistration(
     sub: Subscription,
+    userKey: EventCallback,
     registered: EventCallback,
-  ): void {
-    sub.registry.callbacks.push(registered);
-    let registrations = this.#cbIndex.get(userKey);
-    if (!registrations) {
-      registrations = [];
-      this.#cbIndex.set(userKey, registrations);
+    created: boolean,
+  ): Promise<void> {
+    const callbackIndex = sub.registry.callbacks.indexOf(registered);
+    if (callbackIndex !== -1) {
+      sub.registry.callbacks.splice(callbackIndex, 1);
     }
-    registrations.push({ sub, registered });
-  }
 
-  async #rollbackCreatedSubscription(sub: Subscription): Promise<void> {
-    this.#subscriptions.delete(mapKey(sub.topic, sub.id));
-    sub.unregisterWake?.();
-    await sub.loop.stop();
-    if (!sub.isGroup) {
-      await this.#pool.query(`DELETE FROM ${this.#q('subscriptions')} WHERE id = $1`, [sub.id]);
+    const registrations = this.#cbIndex.get(userKey);
+    if (registrations) {
+      const remaining = registrations.filter(
+        (registration) => registration.sub !== sub || registration.registered !== registered,
+      );
+      if (remaining.length === 0) {
+        this.#cbIndex.delete(userKey);
+      } else {
+        this.#cbIndex.set(userKey, remaining);
+      }
+    }
+
+    if (created) {
+      await this.#teardownSubscription(sub);
     }
   }
 
