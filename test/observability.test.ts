@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
+import { Mastra } from '@mastra/core/mastra';
 import type {
   PubSubLogger,
   PubSubTraceAttributes,
@@ -736,5 +737,21 @@ test('throwing logger and tracer sinks do not affect pubsub behavior', async () 
   } finally {
     await startThrowPs.close();
     await dropSchema(startThrowSchema);
+  }
+
+  const lifecycleThrowSchema = uniqueSchema();
+  const lifecycleThrowPs = makePubSub(lifecycleThrowSchema, {
+    logger: throwingLogger,
+    tracer: throwingTracer,
+    cleanupIntervalMs: 0,
+  });
+  const mastra = new Mastra({ pubsub: lifecycleThrowPs, logger: false, workers: false });
+
+  try {
+    assert.doesNotThrow(() => lifecycleThrowPs.wireMastraLifecycle(mastra));
+    await assert.doesNotReject(() => mastra.startWorkers());
+    await assert.doesNotReject(() => mastra.shutdown());
+  } finally {
+    await dropSchema(lifecycleThrowSchema);
   }
 });

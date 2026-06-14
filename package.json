@@ -1,6 +1,6 @@
 {
   "name": "mastra-pg-pubsub",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "PostgreSQL-backed PubSub adapter for Mastra: at-least-once delivery, consumer groups, replay from offset, dead-lettering, and low-latency LISTEN/NOTIFY wakeups.",
   "type": "module",
   "license": "MIT",
@@ -45,6 +45,7 @@
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
     "test": "node --test --test-concurrency=1 'test/*.test.ts'",
+    "test:cluster": "node --test --test-concurrency=1 test/cluster.test.ts",
     "test:coverage": "node --test --test-concurrency=1 --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-lines=95 --test-coverage-functions=95 --test-coverage-branches=90 'test/*.test.ts'",
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down -v",

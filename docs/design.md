@@ -22,7 +22,7 @@ all on a database you already run.
 
 ## Schema
 
-Everything lives in a dedicated PostgreSQL schema (default `mastra_pubsub`), created
+Everything lives in a dedicated PostgreSQL schema (default `mastra_pg_pubsub`), created
 lazily under an advisory lock, or explicitly via `migrate()`.
 
 ```
@@ -82,6 +82,14 @@ get them through replay.
   errors are logged, never thrown; unsettled deliveries after the bounded drain window make `flush()` reject instead of reporting a clean drain.
 - `close()` stops loops, releases the listener, deletes private subscriptions, ends the
   pool (only if the library created it).
+- `wireMastraLifecycle(mastra)` wraps one Mastra instance: it calls `start()` before
+  `startWorkers()`, rolls back partially-started workers through Mastra shutdown,
+  calls `close()` after successful shutdown, and closes the adapter after startup
+  failures when doing so would not erase unsettled delivery evidence. If `flush()`
+  times out during shutdown, the bridge skips destructive close so private
+  subscription and delivery rows remain available for retry or inspection. The
+  bridge must be installed immediately after `new Mastra({ pubsub, ... })` and
+  before any worker-start or shutdown path.
 - Periodic maintenance (every `cleanupIntervalMs`): trim each topic to `maxEventsPerTopic`
   (never deleting events with pending deliveries) and prune private subscriptions whose
   `last_seen_at` heartbeat went stale (`staleSubscriptionMs`), so dead fan-out subscribers
@@ -99,7 +107,7 @@ get them through replay.
 interface PostgresPubSubConfig {
   connectionString?: string;     // or...
   pool?: pg.Pool;                // bring-your-own pool (never ended by close())
-  schema?: string;               // default 'mastra_pubsub'
+  schema?: string;               // default 'mastra_pg_pubsub'
   pollIntervalMs?: number;       // default 1000
   ackDeadlineMs?: number;        // visibility timeout, default 30_000
   nackDelayMs?: number;          // default 0
@@ -123,7 +131,8 @@ Defaults mirror `@mastra/redis-streams` where a counterpart exists
 The adapter exposes dependency-free observability hooks. `logger` emits structured
 debug/warn/error messages, and `tracer` emits `pg_pubsub.*` spans/events for
 publish, subscribe/unsubscribe, replay/history, flush, maintenance, close,
-delivery claim/ack/nack/drop, and `LISTEN/NOTIFY` listener lifecycle.
+delivery claim/ack/nack/drop, Mastra lifecycle bridge start/shutdown, and
+`LISTEN/NOTIFY` listener lifecycle.
 
 Observability is side-effect-only:
 
@@ -152,5 +161,23 @@ Observability is side-effect-only:
 - ESM-only. Tests with `node:test`; coverage with the built-in coverage reporter,
   enforced thresholds. Build = `tsc` to `dist/` (the only transpile step).
 - Lint/format: Biome. Postgres for dev/test via `docker compose` (pinned major image).
+- Cluster tests: key-free child-process Mastra instances proving fan-out, competing
+  groups, and history across process boundaries against a shared live database.
 - E2E: real Mastra instance + real OpenAI agent (`OPENAI_API_KEY` from `.env`) proving
-  cross-instance delivery, semantics, and replay against a live database.
+  durable-agent stream compatibility against a live database.
+
+## Mastra setup pattern
+
+```ts
+const pubsub = new PostgresPubSub({
+  connectionString: process.env.DATABASE_URL,
+});
+
+const mastra = new Mastra({ pubsub, logger: false });
+pubsub.wireMastraLifecycle(mastra);
+```
+
+Existing deployments that need to keep using the old tables can set
+`schema: 'mastra_pubsub'` explicitly while planning a migration to the new
+`mastra_pg_pubsub` default. PostgreSQL reserves schema names beginning with
+`pg_`, so literal `pg_pubsub` is rejected during configuration validation.

@@ -57,6 +57,16 @@ export interface PubSubTracer {
 }
 
 /**
+ * Minimal structural contract used by {@link PostgresPubSub.wireMastraLifecycle}.
+ * It intentionally avoids depending on Mastra internals beyond the public
+ * lifecycle methods this adapter wraps.
+ */
+export interface MastraLifecycleHost {
+  startWorkers(name?: string): Promise<void>;
+  shutdown(): Promise<void>;
+}
+
+/**
  * Configuration for {@link PostgresPubSub}.
  *
  * Provide exactly one of {@link PostgresPubSubConfig.connectionString} or
@@ -78,7 +88,8 @@ export interface PostgresPubSubConfig {
   pool?: Pool;
   /**
    * PostgreSQL schema that holds every table. Must match
-   * `^[a-z_][a-z0-9_]*$`. Defaults to `mastra_pubsub`.
+   * `^[a-z_][a-z0-9_]*$` and must not start with PostgreSQL's reserved
+   * `pg_` prefix. Defaults to `mastra_pg_pubsub`.
    */
   schema?: string;
   /**

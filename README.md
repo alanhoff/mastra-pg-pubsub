@@ -35,12 +35,9 @@ import { PostgresPubSub } from 'mastra-pg-pubsub';
 
 const pubsub = new PostgresPubSub({
   connectionString: process.env.DATABASE_URL,
-  schema: 'mastra_pubsub',
 });
 
-await pubsub.migrate(); // optional; methods migrate lazily too
-
-export const mastra = new Mastra({
+const mastra = new Mastra({
   pubsub,
   agents: {
     assistant: new Agent({
@@ -51,6 +48,10 @@ export const mastra = new Mastra({
     }),
   },
 });
+
+pubsub.wireMastraLifecycle(mastra);
+
+export { mastra };
 ```
 
 You can also use it directly through the Mastra PubSub contract:
@@ -96,7 +97,7 @@ Provide exactly one of `connectionString` or `pool`.
 | --- | ---: | --- |
 | `connectionString` | — | PostgreSQL connection string. The adapter owns and closes its pool. |
 | `pool` | — | Bring-your-own `pg.Pool`; never closed by `PostgresPubSub.close()`. |
-| `schema` | `mastra_pubsub` | Schema for all tables. Must match `^[a-z_][a-z0-9_]*$`. |
+| `schema` | `mastra_pg_pubsub` | Schema for all tables. Must match `^[a-z_][a-z0-9_]*$` and cannot start with PostgreSQL's reserved `pg_` prefix. |
 | `pollIntervalMs` | `1000` | Backstop polling interval and redelivery detection bound. |
 | `ackDeadlineMs` | `30000` | Visibility timeout before unacked deliveries can be reclaimed. |
 | `nackDelayMs` | `0` | Delay before a nacked delivery becomes visible again. |
@@ -109,6 +110,36 @@ Provide exactly one of `connectionString` or `pool`.
 | `deadLetter` | `false` | Copy exhausted events to `dead_events`. |
 | `logger` | silent | Optional `debug`, `warn`, and `error` functions with structured context. |
 | `tracer` | silent | Optional package-neutral tracing hooks for spans and events. |
+
+### Lifecycle
+
+Call `pubsub.wireMastraLifecycle(mastra)` immediately after constructing your
+Mastra instance. The bridge migrates the SQL before `mastra.startWorkers()` runs,
+closes the adapter after `mastra.shutdown()`, and cleans up if Mastra startup
+fails after the PubSub has already started.
+
+If shutdown fails because `flush()` timed out with locally unsettled deliveries,
+the bridge leaves the adapter open instead of deleting private subscription rows,
+so the pending delivery evidence remains available for retry or inspection.
+
+Direct PubSub calls still migrate lazily, and you can still call
+`await pubsub.start()`, `await pubsub.migrate()`, `await pubsub.flush()`, and
+`await pubsub.close()` yourself when you are not letting Mastra own the lifecycle.
+
+### Default schema upgrade note
+
+New instances use the dedicated `mastra_pg_pubsub` schema by default and create
+it automatically. PostgreSQL reserves schema names beginning with `pg_`, so the
+literal `pg_pubsub` schema cannot be auto-created. Existing deployments that
+already use the old `mastra_pubsub` schema can keep using those tables
+explicitly:
+
+```ts
+const pubsub = new PostgresPubSub({
+  connectionString: process.env.DATABASE_URL,
+  schema: 'mastra_pubsub',
+});
+```
 
 ## Observability
 
@@ -158,8 +189,10 @@ const pubsub = new PostgresPubSub({
 ```
 
 Trace names use the `pg_pubsub.*` prefix, including spans such as
-`pg_pubsub.publish`, `pg_pubsub.delivery`, `pg_pubsub.flush`, and listener or
-maintenance lifecycle spans.
+`pg_pubsub.lifecycle.start`, `pg_pubsub.lifecycle.mastra.start_workers`,
+`pg_pubsub.lifecycle.mastra.shutdown`, `pg_pubsub.publish`,
+`pg_pubsub.delivery`, `pg_pubsub.flush`, and listener or maintenance lifecycle
+spans.
 
 ## Delivery guarantees
 
@@ -171,7 +204,7 @@ maintenance lifecycle spans.
 | Fan-out | Each groupless subscriber receives every event published after it subscribes. |
 | Replay | Historical events are ordered by per-topic `index` and available until retention trims them. |
 | Idempotency | Event `id` is stable across redeliveries for consumer-side dedupe. |
-| Lifecycle | `flush()` drains in-flight local work; `close()` is idempotent and cleans private subscriptions. |
+| Lifecycle | `wireMastraLifecycle()` migrates before Mastra starts and closes after Mastra shutdown; `flush()` drains in-flight local work; `close()` is idempotent and cleans private subscriptions. |
 
 This is intentionally **not exactly-once** delivery. Consumers that perform side effects should dedupe by `event.id` or a domain idempotency key.
 
@@ -187,7 +220,9 @@ flowchart LR
   CB -->|nack: visible_at = now()+nackDelay| DB
 ```
 
-The schema is created lazily under a Postgres advisory lock, or explicitly with `await pubsub.migrate()`.
+The schema is created lazily under a Postgres advisory lock, explicitly with
+`await pubsub.migrate()`, or during Mastra startup when
+`wireMastraLifecycle()` is installed.
 
 ## Local development
 
@@ -195,6 +230,7 @@ The schema is created lazily under a Postgres advisory lock, or explicitly with 
 npm install
 npm run db:up
 npm test
+npm run test:cluster
 npm run test:coverage
 npm run typecheck
 npm run lint
@@ -202,6 +238,9 @@ npm run build
 ```
 
 `npm test` is key-free and uses the pinned Postgres service from `docker-compose.yml` on port `5544`.
+`npm run test:cluster` runs the process-level cluster proof: multiple child Node
+processes each create a real `Mastra` container with this adapter, then verify
+fan-out, competing-consumer groups, and history through the shared Postgres schema.
 
 ### Real e2e tests
 

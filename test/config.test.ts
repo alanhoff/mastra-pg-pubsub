@@ -2,7 +2,15 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import pg from 'pg';
 import { PostgresPubSub } from '../src/index.ts';
-import { DATABASE_URL, dropSchema, makePubSub, uniqueSchema } from './helpers.ts';
+import {
+  DATABASE_URL,
+  dropSchema,
+  isDisposableTestDatabase,
+  makePubSub,
+  schemaExists,
+  tableExists,
+  uniqueSchema,
+} from './helpers.ts';
 
 const schema = uniqueSchema();
 const pubsubs: Array<{ close(): Promise<void> }> = [];
@@ -13,7 +21,7 @@ after(async () => {
 });
 
 test('invalid schema names throw from the constructor', () => {
-  const invalidNames = ['Bad-Name', '1abc', 'has space', 'with-dash', ''];
+  const invalidNames = ['Bad-Name', '1abc', 'has space', 'with-dash', 'pg_pubsub', ''];
   for (const name of invalidNames) {
     assert.throws(
       () =>
@@ -97,19 +105,44 @@ test('concurrent migrate across two instances does not error', async () => {
   });
 });
 
-test('schema defaults to mastra_pubsub when not provided', async () => {
-  // Can't easily test the default schema without risking pollution,
-  // so we just verify the config is accepted with no schema key
+test('schema defaults to mastra_pg_pubsub and auto-creates the schema when not provided', async (t) => {
+  if (!isDisposableTestDatabase()) {
+    t.skip('default-schema drop is only safe against the disposable local test database');
+    return;
+  }
+  await dropSchema('mastra_pg_pubsub');
   const ps = new PostgresPubSub({
     connectionString: DATABASE_URL,
     cleanupIntervalMs: 0,
     pollIntervalMs: 100,
   });
-  pubsubs.push(ps);
-  // Migration (and schema creation) should succeed
-  await assert.doesNotReject(async () => {
+  try {
     await ps.migrate();
+    assert.equal(await schemaExists('mastra_pg_pubsub'), true);
+    assert.equal(await tableExists('mastra_pg_pubsub', 'events'), true);
+    assert.equal(await tableExists('mastra_pg_pubsub', 'subscriptions'), true);
+  } finally {
+    await ps.close();
+    await dropSchema('mastra_pg_pubsub');
+  }
+});
+
+test('custom schema is still created when schema is provided', async () => {
+  const customSchema = uniqueSchema();
+  const ps = new PostgresPubSub({
+    connectionString: DATABASE_URL,
+    schema: customSchema,
+    cleanupIntervalMs: 0,
+    pollIntervalMs: 100,
   });
+  try {
+    await ps.migrate();
+    assert.equal(await schemaExists(customSchema), true);
+    assert.equal(await tableExists(customSchema, 'events'), true);
+  } finally {
+    await ps.close();
+    await dropSchema(customSchema);
+  }
 });
 
 test('maxDeliveryAttempts=0 produces exactly one warn', () => {

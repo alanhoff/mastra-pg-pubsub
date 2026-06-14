@@ -22,6 +22,55 @@ export async function dropSchema(schema: string): Promise<void> {
   }
 }
 
+/** True only for the repo's disposable docker-compose test database. */
+export function isDisposableTestDatabase(): boolean {
+  try {
+    const url = new URL(DATABASE_URL);
+    return (
+      (url.hostname === 'localhost' || url.hostname === '127.0.0.1') &&
+      url.port === '5544' &&
+      url.pathname === '/mastra_pubsub' &&
+      url.username === 'postgres'
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Check whether a PostgreSQL schema exists. */
+export async function schemaExists(schema: string): Promise<boolean> {
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  try {
+    const result = await pool.query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM information_schema.schemata WHERE schema_name = $1
+       ) AS exists`,
+      [schema],
+    );
+    return result.rows[0]?.exists ?? false;
+  } finally {
+    await pool.end();
+  }
+}
+
+/** Check whether a table exists inside a PostgreSQL schema. */
+export async function tableExists(schema: string, table: string): Promise<boolean> {
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  try {
+    const result = await pool.query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM information_schema.tables
+         WHERE table_schema = $1 AND table_name = $2
+       ) AS exists`,
+      [schema, table],
+    );
+    return result.rows[0]?.exists ?? false;
+  } finally {
+    await pool.end();
+  }
+}
+
 /** Construct a PostgresPubSub against the test DB with sensible fast defaults. */
 export function makePubSub(
   schema: string,
