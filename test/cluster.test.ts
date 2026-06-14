@@ -34,6 +34,18 @@ interface PendingReply {
 const schema = uniqueSchema();
 const workers: ClusterWorker[] = [];
 
+function workerEnv(): NodeJS.ProcessEnv {
+  return {
+    DATABASE_URL:
+      process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5544/mastra_pubsub',
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    PATH: process.env.PATH,
+    TMPDIR: process.env.TMPDIR,
+    TEMP: process.env.TEMP,
+    TMP: process.env.TMP,
+  };
+}
+
 after(async () => {
   await Promise.allSettled(workers.map((worker) => worker.close()));
   await dropSchema(schema);
@@ -55,11 +67,7 @@ class ClusterWorker {
     const workerPath = fileURLToPath(new URL('./fixtures/cluster-worker.ts', import.meta.url));
     this.#child = fork(workerPath, [], {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
-      env: {
-        ...process.env,
-        DATABASE_URL:
-          process.env.DATABASE_URL ?? 'postgres://postgres:postgres@localhost:5544/mastra_pubsub',
-      },
+      env: workerEnv(),
       execArgv: [],
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });

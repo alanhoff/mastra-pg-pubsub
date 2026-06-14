@@ -3,6 +3,7 @@ import type { IMastraLogger } from '@mastra/core/logger';
 import pg from 'pg';
 import type { PostgresPubSubConfig } from '../src/index.ts';
 import { PostgresPubSub } from '../src/index.ts';
+import { assertValidSchema, quoteIdentifier } from '../src/sql.ts';
 
 /** Connection string for the docker-compose Postgres, overridable via env. */
 export const DATABASE_URL =
@@ -17,7 +18,7 @@ export function uniqueSchema(): string {
 export async function dropSchema(schema: string): Promise<void> {
   const pool = new pg.Pool({ connectionString: DATABASE_URL });
   try {
-    await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await pool.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(assertValidSchema(schema))} CASCADE`);
   } finally {
     await pool.end();
   }

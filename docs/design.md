@@ -34,7 +34,7 @@ deliveries     event_seq BIGINT FK->events, subscription_id TEXT FK->subscriptio
 dead_events    optional copy of event + subscription + attempts when deadLetter is true
 ```
 
-PostgreSQL reserves the `pg_` prefix. When the default schema is absent, the migration enables the session flag needed to create this package-owned schema; when the schema already exists, ordinary roles only need table-creation privileges inside it. Other custom `pg_` names are rejected; users can select an ordinary schema name when their database policy requires one.
+PostgreSQL reserves the `pg_` prefix. When the default schema is absent, the migration enables the session flag needed to create this package-owned schema; when the schema already exists, ordinary roles only need table-creation privileges inside it. Production deployments can keep runtime roles least-privileged by running `pubsub.migrate()` during deploy with an admin/migration role, then starting app processes with DML privileges on the adapter tables plus schema usage and `LISTEN/NOTIFY` access. Other custom `pg_` names are rejected; users can select an ordinary schema name when their database policy requires one.
 
 ## Data Flow
 
@@ -72,7 +72,7 @@ Subscribers created after publish do not receive prior events, but can get them 
 - `publish`, `subscribe`, `getHistory`, `subscribeWithReplay`, `subscribeFromOffset`, `start`, `init`, and `migrate` start lazily when they need the database.
 - Startup migrates the schema once and starts maintenance when `cleanupIntervalMs > 0`.
 - Unsubscribing stops the consume loop for that subscription. When no local subscriptions remain, the adapter closes the listener, clears the maintenance timer, and resets start state so future database use restarts lazily.
-- `flush()` drains in-flight local work and rejects if unsettled local deliveries remain after the bounded drain window.
+- `flush()` drains in-flight publishes and delivery rows for this instance's active subscription ids. Private ids are local to the process; group ids are shared, so group flush is intentionally group-wide for the `(topic, group)` subscription.
 - `close()` is terminal and idempotent. It stops loops, releases the listener, deletes private subscriptions, and ends only pools created by this library.
 
 ## Replay
@@ -88,14 +88,14 @@ interface PostgresPubSubConfig {
   connectionString?: string;
   pool?: pg.Pool;
   schema?: string; // default 'pg_pubsub'
-  pollIntervalMs?: number;
-  ackDeadlineMs?: number;
-  nackDelayMs?: number;
-  maxDeliveryAttempts?: number;
-  batchSize?: number;
-  maxEventsPerTopic?: number;
-  cleanupIntervalMs?: number;
-  staleSubscriptionMs?: number;
+  pollIntervalMs?: number; // positive safe integer
+  ackDeadlineMs?: number; // positive safe integer
+  nackDelayMs?: number; // non-negative safe integer
+  maxDeliveryAttempts?: number; // positive safe integer, Infinity, or 0 -> Infinity
+  batchSize?: number; // positive safe integer
+  maxEventsPerTopic?: number; // non-negative safe integer
+  cleanupIntervalMs?: number; // non-negative safe integer
+  staleSubscriptionMs?: number; // positive safe integer
   listen?: boolean;
   deadLetter?: boolean;
   logger?: IMastraLogger | false;
@@ -112,7 +112,7 @@ The adapter emits payload-safe logs plus Mastra observability spans/events:
 - Operation spans are created as generic child spans of the current span when one exists.
 - Delivery callbacks run inside the delivery span context so downstream work inherits the correct async context.
 
-Emitted context is allow-listed scalar metadata such as topic, event id/type/index, run id, subscription id/kind, attempts, counts, status, and duration. Event payload `data`, connection strings, raw database rows, secrets, and arbitrary user objects are excluded. Errors are sanitized to fields such as `error.name`.
+Emitted context is allow-listed scalar metadata such as topic, event id/type/index, run id, subscription id/kind, attempts, counts, status, and duration. Event payload `data`, connection strings, raw database rows, secrets, and arbitrary user objects are excluded. Topic, group, run id, and subscription values are still operator-visible metadata, so applications should avoid embedding sensitive tenant/user identifiers in them or should hash/pseudonymize those identifiers before publishing/subscribing. Errors are sanitized to fields such as `error.name`.
 
 ## Delivery Guarantees
 
@@ -133,4 +133,4 @@ Emitted context is allow-listed scalar metadata such as topic, event id/type/ind
 - Lint/format: Biome.
 - Postgres for dev/test via Docker Compose.
 - Cluster tests prove fan-out, consumer groups, and history across child-process Mastra instances.
-- E2E tests prove real Mastra integration against live Postgres, with the OpenAI-backed case gated by `OPENAI_API_KEY`.
+- E2E tests split key-free PubSub semantics from the OpenAI-backed Mastra durable-agent case gated by `OPENAI_API_KEY`.

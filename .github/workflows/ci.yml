@@ -43,12 +43,13 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      - run: npm run test:cluster
       - run: npm run test:coverage
       - run: npm run build
       - run: npm pack --dry-run
 
   e2e:
-    name: Real Mastra e2e
+    name: E2E
     runs-on: ubuntu-latest
     needs: verify
     services:
@@ -75,12 +76,14 @@ jobs:
           node-version: 24.x
           cache: npm
       - run: npm ci
-      - name: Skip without OpenAI key
+      - name: Run key-free PubSub e2e semantics
+        run: npm run test:e2e:semantics
+      - name: Skip Mastra/OpenAI e2e without key
         if: env.OPENAI_API_KEY == ''
-        run: echo "OPENAI_API_KEY is not configured; skipping real e2e."
-      - name: Run real e2e
+        run: echo "OPENAI_API_KEY is not configured; key-free e2e already ran."
+      - name: Run Mastra/OpenAI e2e
         if: env.OPENAI_API_KEY != ''
         run: |
           trap 'rm -f .env' EXIT
           printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > .env
-          npm run test:e2e
+          npm run test:e2e:mastra

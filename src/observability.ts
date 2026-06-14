@@ -226,7 +226,33 @@ class SafeObservabilitySpan implements ActiveObservabilitySpan {
   }
 
   async run<T>(fn: () => Promise<T>): Promise<T> {
-    return executeWithContext({ span: this.#span, fn });
+    let callbackCompleted = false;
+    let callbackError: unknown;
+    let callbackResult: T | undefined;
+
+    try {
+      return await executeWithContext({
+        span: this.#span,
+        fn: async () => {
+          try {
+            callbackResult = await fn();
+            callbackCompleted = true;
+            return callbackResult;
+          } catch (error) {
+            callbackError = error;
+            throw error;
+          }
+        },
+      });
+    } catch (error) {
+      if (callbackError === error) {
+        throw error;
+      }
+      if (callbackCompleted) {
+        return callbackResult as T;
+      }
+      return fn();
+    }
   }
 
   end(status: SpanStatus = { code: 'ok' }): void {
