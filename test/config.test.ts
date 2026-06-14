@@ -231,7 +231,9 @@ test('valid schema names: lowercase, underscore, digits after first char', () =>
 });
 
 test('invalid numeric options throw from the constructor before reaching timers or SQL', () => {
-  const invalidCases: Array<[string, Partial<Parameters<typeof PostgresPubSub>[0]>, RegExp]> = [
+  const invalidCases: Array<
+    [string, Partial<ConstructorParameters<typeof PostgresPubSub>[0]>, RegExp]
+  > = [
     ['pollIntervalMs zero', { pollIntervalMs: 0 }, /pollIntervalMs/],
     ['pollIntervalMs NaN', { pollIntervalMs: Number.NaN }, /pollIntervalMs/],
     ['ackDeadlineMs negative', { ackDeadlineMs: -1 }, /ackDeadlineMs/],

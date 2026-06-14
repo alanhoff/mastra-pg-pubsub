@@ -269,9 +269,7 @@ export class PostgresPubSub extends PubSub {
         this.#migrated = undefined;
       }
       span.recordError(error);
-      if (this.#migrated) {
-        this.#migrated = undefined;
-      }
+      this.#migrated = undefined;
       span.end({ code: 'error', message: 'migration failed' });
       throw error;
     }
