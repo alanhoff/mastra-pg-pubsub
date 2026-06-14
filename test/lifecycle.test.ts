@@ -314,7 +314,52 @@ test('subscribe rolls back local and private row state when listener setup fails
     schema: rollbackSchema,
     listen: true,
     cleanupIntervalMs: 0,
-    pollIntervalMs: 25,
+    pollIntervalMs: 10_000,
+  });
+  pubsubs.push(ps);
+
+  await ps.migrate();
+
+  const originalConnect = pool.connect.bind(pool);
+  let connectCalls = 0;
+  pool.connect = (async (...args: []) => {
+    connectCalls++;
+    if (connectCalls === 2) {
+      throw new Error('listen connect failed');
+    }
+    return originalConnect(...args);
+  }) as typeof pool.connect;
+
+  try {
+    await assert.rejects(
+      () =>
+        ps.subscribe(topic, (_event, ack) => {
+          ack?.();
+        }),
+      /listen connect failed/,
+    );
+  } finally {
+    pool.connect = originalConnect as typeof pool.connect;
+  }
+
+  assert.equal(await subscriptionRowCount(rollbackSchema, topic), 0);
+
+  await ps.subscribe(topic, (_event, ack) => {
+    ack?.();
+  });
+  assert.equal(await subscriptionRowCount(rollbackSchema, topic), 1);
+
+  await ps.close();
+  await pool.end();
+  await dropSchema(rollbackSchema);
+});
+
+test('concurrent same-group subscribes serialize to one local consume loop', async () => {
+  const groupSchema = uniqueSchema();
+  const debugMessages: string[] = [];
+  const ps = makePubSub(groupSchema, {
+    listen: false,
+    pollIntervalMs: 10_000,
     logger: makeTestLogger({
       warn: (message: string) => {
         warnMessages.push(message);
