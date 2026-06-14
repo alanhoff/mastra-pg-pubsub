@@ -3,7 +3,14 @@ import { after, test } from 'node:test';
 import type { Event } from '@mastra/core/events';
 import pg from 'pg';
 import { PostgresPubSub } from '../src/index.ts';
-import { DATABASE_URL, dropSchema, makePubSub, makeTestLogger, uniqueSchema, waitFor } from './helpers.ts';
+import {
+  DATABASE_URL,
+  dropSchema,
+  makePubSub,
+  makeTestLogger,
+  uniqueSchema,
+  waitFor,
+} from './helpers.ts';
 
 const schema = uniqueSchema();
 const pubsubs: Array<{ close(): Promise<void> }> = [];
@@ -182,7 +189,6 @@ test('group subscription persists across instances: only one receives per event'
   assert.equal(received[0], 0);
 });
 
-
 test('concurrent same-group subscribes create one local consume loop', async () => {
   const concurrentSchema = uniqueSchema();
   const pool = new pg.Pool({ connectionString: DATABASE_URL });
@@ -214,8 +220,8 @@ test('concurrent same-group subscribes create one local consume loop', async () 
       return await originalQuery(...args);
     }) as typeof pool.query;
 
-    const cbA = (event: Event, ack?: () => void) => ack?.();
-    const cbB = (event: Event, ack?: () => void) => ack?.();
+    const cbA = (_event: Event, ack?: () => void) => ack?.();
+    const cbB = (_event: Event, ack?: () => void) => ack?.();
     await Promise.all([
       ps.subscribe('topic-concurrent-group', cbA, { group: 'same-group' }),
       ps.subscribe('topic-concurrent-group', cbB, { group: 'same-group' }),
@@ -231,4 +237,32 @@ test('concurrent same-group subscribes create one local consume loop', async () 
     await pool.end();
     await dropSchema(concurrentSchema);
   }
+});
+
+test('concurrent same-group subscribes share one coherent local subscription', async () => {
+  const ps = makePubSub(uniqueSchema(), { listen: false, pollIntervalMs: 25 });
+  pubsubs.push(ps);
+
+  const cb1Events: number[] = [];
+  const cb2Events: number[] = [];
+  const cb1 = (event: Event, ack?: () => void) => {
+    if (event.index !== undefined) cb1Events.push(event.index);
+    ack?.();
+  };
+  const cb2 = (event: Event, ack?: () => void) => {
+    if (event.index !== undefined) cb2Events.push(event.index);
+    ack?.();
+  };
+
+  await Promise.all([
+    ps.subscribe('topic-concurrent-group', cb1, { group: 'same-group' }),
+    ps.subscribe('topic-concurrent-group', cb2, { group: 'same-group' }),
+  ]);
+  await ps.unsubscribe('topic-concurrent-group', cb1);
+
+  await ps.publish('topic-concurrent-group', { type: 'e', data: null, runId: 'r' });
+  await waitFor(() => cb2Events.length === 1, { timeoutMs: 5_000 });
+
+  assert.deepEqual(cb1Events, [], 'unsubscribed callback should not receive later work');
+  assert.deepEqual(cb2Events, [0], 'remaining callback should keep the shared group active');
 });

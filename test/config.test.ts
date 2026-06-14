@@ -213,35 +213,6 @@ test('maxDeliveryAttempts=0 produces exactly one warn', () => {
   );
 });
 
-
-
-test('invalid numeric options throw before reaching timers or SQL', () => {
-  const invalidCases: Array<[string, Partial<ConstructorParameters<typeof PostgresPubSub>[0]>]> = [
-    ['pollIntervalMs', { pollIntervalMs: 0 }],
-    ['ackDeadlineMs', { ackDeadlineMs: Number.NaN }],
-    ['nackDelayMs', { nackDelayMs: -1 }],
-    ['batchSize', { batchSize: 1.5 }],
-    ['maxEventsPerTopic', { maxEventsPerTopic: Number.POSITIVE_INFINITY }],
-    ['cleanupIntervalMs', { cleanupIntervalMs: -1 }],
-    ['staleSubscriptionMs', { staleSubscriptionMs: 0 }],
-    ['maxDeliveryAttempts', { maxDeliveryAttempts: -1 }],
-  ];
-
-  for (const [option, overrides] of invalidCases) {
-    assert.throws(
-      () =>
-        new PostgresPubSub({
-          connectionString: DATABASE_URL,
-          schema,
-          cleanupIntervalMs: 0,
-          ...overrides,
-        }),
-      new RegExp(option),
-      `${option} should be validated`,
-    );
-  }
-});
-
 test('valid schema names: lowercase, underscore, digits after first char', () => {
   const validNames = ['abc', 'a_b_c', 'test123', '_private', 'my_schema_1'];
   for (const name of validNames) {
@@ -257,4 +228,47 @@ test('valid schema names: lowercase, underscore, digits after first char', () =>
       `expected no throw for schema name: ${JSON.stringify(name)}`,
     );
   }
+});
+
+test('invalid numeric options throw before reaching timers or SQL', () => {
+  const invalidCases: Array<
+    [keyof import('../src/index.ts').PostgresPubSubConfig, number, RegExp]
+  > = [
+    ['pollIntervalMs', 0, /pollIntervalMs/],
+    ['pollIntervalMs', Number.NaN, /pollIntervalMs/],
+    ['ackDeadlineMs', -1, /ackDeadlineMs/],
+    ['nackDelayMs', -1, /nackDelayMs/],
+    ['batchSize', 1.5, /batchSize/],
+    ['maxEventsPerTopic', -1, /maxEventsPerTopic/],
+    ['cleanupIntervalMs', Number.POSITIVE_INFINITY, /cleanupIntervalMs/],
+    ['staleSubscriptionMs', 0, /staleSubscriptionMs/],
+    ['maxDeliveryAttempts', Number.NaN, /maxDeliveryAttempts/],
+  ];
+
+  for (const [option, value, message] of invalidCases) {
+    assert.throws(
+      () =>
+        new PostgresPubSub({
+          connectionString: DATABASE_URL,
+          schema,
+          [option]: value,
+        }),
+      message,
+      `${option}=${String(value)} should be rejected`,
+    );
+  }
+});
+
+test('numeric options allow documented zero and infinity sentinels', () => {
+  assert.doesNotThrow(() => {
+    const ps = new PostgresPubSub({
+      connectionString: DATABASE_URL,
+      schema,
+      nackDelayMs: 0,
+      maxEventsPerTopic: 0,
+      cleanupIntervalMs: 0,
+      maxDeliveryAttempts: Number.POSITIVE_INFINITY,
+    });
+    pubsubs.push(ps);
+  });
 });

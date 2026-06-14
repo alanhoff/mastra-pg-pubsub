@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import type { EventCallback } from '@mastra/core/events';
+import type { Pool, QueryResult, QueryResultRow } from 'pg';
 import pg from 'pg';
 import { PostgresPubSub } from '../src/index.ts';
 import {
@@ -13,6 +14,62 @@ import {
   uniqueSchema,
   waitFor,
 } from './helpers.ts';
+
+interface FakeClient {
+  query<T extends QueryResultRow = QueryResultRow>(sql: string): Promise<QueryResult<T>>;
+  release(): void;
+}
+
+class RetryMigrationPool {
+  connectCount = 0;
+  readonly #failFirstConnect: boolean;
+
+  constructor({ failFirstConnect }: { failFirstConnect: boolean }) {
+    this.#failFirstConnect = failFirstConnect;
+  }
+
+  async connect(): Promise<FakeClient> {
+    this.connectCount++;
+    if (this.#failFirstConnect && this.connectCount === 1) {
+      throw new Error('transient connect failure');
+    }
+    return {
+      query: async <T extends QueryResultRow = QueryResultRow>(sql: string) => {
+        const rows = sql.includes('to_regnamespace') ? [{ exists: true }] : [];
+        return { rows } as unknown as QueryResult<T>;
+      },
+      release: () => undefined,
+    };
+  }
+
+  async query<T extends QueryResultRow = QueryResultRow>(): Promise<QueryResult<T>> {
+    return { rows: [] } as unknown as QueryResult<T>;
+  }
+}
+
+class FailingListenPool {
+  connectCount = 0;
+  readonly queries: string[] = [];
+
+  async connect(): Promise<FakeClient> {
+    this.connectCount++;
+    if (this.connectCount === 2) {
+      throw new Error('listen connect failure');
+    }
+    return {
+      query: async <T extends QueryResultRow = QueryResultRow>(sql: string) => {
+        const rows = sql.includes('to_regnamespace') ? [{ exists: true }] : [];
+        return { rows } as unknown as QueryResult<T>;
+      },
+      release: () => undefined,
+    };
+  }
+
+  async query<T extends QueryResultRow = QueryResultRow>(sql: string): Promise<QueryResult<T>> {
+    this.queries.push(sql);
+    return { rows: [], rowCount: sql.startsWith('DELETE') ? 1 : 0 } as unknown as QueryResult<T>;
+  }
+}
 
 const schema = uniqueSchema();
 const pubsubs: Array<{ close(): Promise<void> }> = [];
@@ -173,7 +230,6 @@ test('idle stop does not close a caller-owned pool', async () => {
   }
 });
 
-
 test('start retries after a transient migration failure on the same instance', async () => {
   const retrySchema = uniqueSchema();
   const pool = new pg.Pool({ connectionString: DATABASE_URL });
@@ -201,52 +257,53 @@ test('start retries after a transient migration failure on the same instance', a
   }
 });
 
-test('subscribe rolls back local and private row state when listener setup fails', async () => {
-  const rollbackSchema = uniqueSchema();
-  const pool = new pg.Pool({ connectionString: DATABASE_URL });
-  const warnMessages: string[] = [];
+test('migrate clears a transient rejected migration promise and retries', async () => {
+  const pool = new RetryMigrationPool({ failFirstConnect: true });
   const ps = new PostgresPubSub({
-    pool,
-    schema: rollbackSchema,
-    listen: true,
+    pool: pool as unknown as Pool,
+    schema: uniqueSchema(),
     cleanupIntervalMs: 0,
-    pollIntervalMs: 25,
-    logger: makeTestLogger({
-      warn: (message: string) => {
-        warnMessages.push(message);
-      },
-    }),
   });
-  const originalConnect = pool.connect.bind(pool);
-  const cb: EventCallback = (_event, ack) => ack?.();
 
-  try {
-    await ps.start();
-    pool.connect = async () => {
-      throw new Error('listen unavailable');
-    };
+  await assert.rejects(() => ps.migrate(), /transient connect failure/);
+  await assert.doesNotReject(() => ps.migrate());
+  assert.equal(pool.connectCount, 2, 'second migrate should acquire a fresh connection');
+});
 
-    await assert.rejects(() => ps.subscribe('topic-rollback', cb), /listen unavailable/);
+test('start clears a transient rejected startup promise and retries', async () => {
+  const pool = new RetryMigrationPool({ failFirstConnect: true });
+  const ps = new PostgresPubSub({
+    pool: pool as unknown as Pool,
+    schema: uniqueSchema(),
+    cleanupIntervalMs: 0,
+  });
 
-    const rowCount = await pool.query<{ count: string }>(
-      `SELECT count(*)::text AS count FROM "${rollbackSchema}".subscriptions WHERE topic = $1`,
-      ['topic-rollback'],
-    );
-    assert.equal(rowCount.rows[0]?.count, '0');
+  await assert.rejects(() => ps.start(), /transient connect failure/);
+  await assert.doesNotReject(() => ps.start());
+  assert.equal(pool.connectCount, 2, 'second start should rerun startup after failure');
+});
 
-    pool.connect = originalConnect;
-    await ps.subscribe('topic-rollback', cb);
-    await ps.publish('topic-rollback', { type: 'after-rollback', data: null, runId: 'run-rollback' });
-    await ps.flush();
-    assert.equal(
-      warnMessages.some((message) => message.includes('failed to roll back subscription')),
-      false,
-      'rollback should complete without warning when the pool remains usable',
-    );
-  } finally {
-    pool.connect = originalConnect;
-    await ps.close().catch(() => undefined);
-    await pool.end();
-    await dropSchema(rollbackSchema);
-  }
+test('failed listen setup rolls back a new private subscription row', async () => {
+  const pool = new FailingListenPool();
+  const ps = new PostgresPubSub({
+    pool: pool as unknown as Pool,
+    schema: uniqueSchema(),
+    cleanupIntervalMs: 0,
+    listen: true,
+  });
+
+  await assert.rejects(
+    () => ps.subscribe('topic-listen-fails', () => undefined),
+    /listen connect failure/,
+  );
+
+  assert.equal(
+    pool.connectCount,
+    2,
+    'migration connect and failed listener connect should both run',
+  );
+  assert.ok(
+    pool.queries.some((sql) => sql.startsWith('DELETE') && sql.includes('subscriptions')),
+    'private subscription row should be deleted on setup rollback',
+  );
 });

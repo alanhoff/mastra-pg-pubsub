@@ -83,7 +83,10 @@ function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
     batchSize: positiveInteger(config.batchSize ?? 32, 'batchSize'),
     maxEventsPerTopic: nonNegativeInteger(config.maxEventsPerTopic ?? 10_000, 'maxEventsPerTopic'),
     cleanupIntervalMs: nonNegativeInteger(config.cleanupIntervalMs ?? 60_000, 'cleanupIntervalMs'),
-    staleSubscriptionMs: positiveInteger(config.staleSubscriptionMs ?? 300_000, 'staleSubscriptionMs'),
+    staleSubscriptionMs: positiveInteger(
+      config.staleSubscriptionMs ?? 300_000,
+      'staleSubscriptionMs',
+    ),
     listen: config.listen ?? true,
     deadLetter: config.deadLetter ?? false,
     logger,
@@ -109,7 +112,9 @@ function maxDeliveryAttemptLimit(value: number): number {
     return value;
   }
   if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error('maxDeliveryAttempts must be a positive safe integer, Infinity, or 0 for Infinity');
+    throw new Error(
+      'maxDeliveryAttempts must be a positive safe integer, Infinity, or 0 for Infinity',
+    );
   }
   return value;
 }
@@ -607,7 +612,6 @@ export class PostgresPubSub extends PubSub {
     }
   }
 
-
   async #serializeSubscriptionSetup<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.#subscriptionLocks.get(key) ?? Promise.resolve();
     let release!: () => void;
@@ -630,7 +634,11 @@ export class PostgresPubSub extends PubSub {
     }
   }
 
-  #addCallbackRegistration(userKey: EventCallback, sub: Subscription, registered: EventCallback): void {
+  #addCallbackRegistration(
+    userKey: EventCallback,
+    sub: Subscription,
+    registered: EventCallback,
+  ): void {
     sub.registry.callbacks.push(registered);
     let registrations = this.#cbIndex.get(userKey);
     if (!registrations) {
@@ -1214,19 +1222,8 @@ export class PostgresPubSub extends PubSub {
     return result.rowCount ?? 0;
   }
 
-
-  async #closeListener(): Promise<void> {
-    if (!this.#listener) {
-      return;
-    }
-    await this.#listener.close();
-    this.#listener = undefined;
-  }
-
   async #clearSubscriptions(): Promise<string[]> {
-    const privateIds = [...this.#subscriptions.values()]
-      .filter((s) => !s.isGroup)
-      .map((s) => s.id);
+    const privateIds = [...this.#subscriptions.values()].filter((s) => !s.isGroup).map((s) => s.id);
     this.#subscriptions.clear();
     if (privateIds.length > 0) {
       await this.#pool
@@ -1243,12 +1240,6 @@ export class PostgresPubSub extends PubSub {
         );
     }
     return privateIds;
-  }
-
-  async #closeOwnedPool(): Promise<void> {
-    if (this.#ownsPool) {
-      await this.#pool.end();
-    }
   }
 
   /**
@@ -1292,10 +1283,15 @@ export class PostgresPubSub extends PubSub {
       }
       await Promise.all([...this.#subscriptions.values()].map((s) => s.loop.stop()));
 
-      await this.#closeListener();
+      if (this.#listener) {
+        await this.#listener.close();
+        this.#listener = undefined;
+      }
 
       const privateIds = await this.#clearSubscriptions();
-      await this.#closeOwnedPool();
+      if (this.#ownsPool) {
+        await this.#pool.end();
+      }
       const context = traceAttributes({
         schema: this.#config.schema,
         ownsPool: this.#ownsPool,
