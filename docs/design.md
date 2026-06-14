@@ -40,6 +40,8 @@ Production deployments should separate migration and runtime privilege when poss
 
 Production deployments should separate migration and runtime privilege when possible: a deploy-time migration role runs `migrate()` or equivalent SQL, while the long-lived application role only needs DML privileges on the package tables. Runtime auto-migration remains a convenience path for development and simple deployments, not a requirement to grant DDL privileges to every application process.
 
+Production deployments should separate migration and runtime privilege when possible: a deploy-time migration role runs `migrate()` or equivalent SQL, while the long-lived application role only needs DML privileges on the package tables. Runtime auto-migration remains a convenience path for development and simple deployments, not a requirement to grant DDL privileges to every application process.
+
 ## Data Flow
 
 ```mermaid
