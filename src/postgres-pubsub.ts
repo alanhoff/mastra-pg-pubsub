@@ -565,7 +565,9 @@ export class PostgresPubSub extends PubSub {
           }
         } catch (error) {
           if (created) {
-            await this.#rollbackCreatedSubscription(sub).catch((rollbackError) => {
+            try {
+              await this.#rollbackCreatedSubscription(sub);
+            } catch (rollbackError) {
               logWarn(
                 this.#logger,
                 'failed to roll back subscription after setup failure',
@@ -576,7 +578,7 @@ export class PostgresPubSub extends PubSub {
                 }),
                 rollbackError,
               );
-            });
+            }
           }
           throw error;
         }
@@ -1226,18 +1228,21 @@ export class PostgresPubSub extends PubSub {
     const privateIds = [...this.#subscriptions.values()].filter((s) => !s.isGroup).map((s) => s.id);
     this.#subscriptions.clear();
     if (privateIds.length > 0) {
-      await this.#pool
-        .query(`DELETE FROM ${this.#q('subscriptions')} WHERE id = ANY($1::text[])`, [privateIds])
-        .catch((error) =>
-          logWarn(
-            this.#logger,
-            'failed to delete private subscriptions',
-            traceAttributes({
-              privateSubscriptionCount: privateIds.length,
-            }),
-            error,
-          ),
+      try {
+        await this.#pool.query(
+          `DELETE FROM ${this.#q('subscriptions')} WHERE id = ANY($1::text[])`,
+          [privateIds],
         );
+      } catch (error) {
+        logWarn(
+          this.#logger,
+          'failed to delete private subscriptions',
+          traceAttributes({
+            privateSubscriptionCount: privateIds.length,
+          }),
+          error,
+        );
+      }
     }
     return privateIds;
   }
