@@ -111,11 +111,28 @@ interface PostgresPubSubConfig {
   listen?: boolean;              // default true (LISTEN/NOTIFY wakeups)
   deadLetter?: boolean;          // default false; keep exhausted events in dead_events
   logger?: { debug?: LogFn; warn?: LogFn; error?: LogFn }; // silent by default
+  tracer?: PubSubTracer;         // package-neutral spans/events, silent by default
 }
 ```
 
 Defaults mirror `@mastra/redis-streams` where a counterpart exists
 (`maxDeliveryAttempts`, retention, reclaim-style timeouts, optional silent logger).
+
+### Observability
+
+The adapter exposes dependency-free observability hooks. `logger` emits structured
+debug/warn/error messages, and `tracer` emits `pg_pubsub.*` spans/events for
+publish, subscribe/unsubscribe, replay/history, flush, maintenance, close,
+delivery claim/ack/nack/drop, and `LISTEN/NOTIFY` listener lifecycle.
+
+Observability is side-effect-only:
+
+- logger/tracer callbacks are wrapped defensively and cannot break PubSub behavior;
+- emitted context is allow-listed scalar metadata such as topic, event id/type/index,
+  run id, subscription id/kind, attempts, counts, status, and duration;
+- callback and database errors are sanitized to scalar metadata such as `error.name`;
+- event payload `data`, connection strings, raw database rows, secrets, and arbitrary
+  user objects are excluded.
 
 ## Delivery guarantees
 

@@ -21,6 +21,41 @@ export interface PubSubLogger {
   error?: LogFn;
 }
 
+/** Scalar values that can be safely attached to trace spans and events. */
+export type PubSubTraceAttributeValue = string | number | boolean | null;
+
+/** Payload-safe trace attributes emitted by the adapter. */
+export type PubSubTraceAttributes = Record<string, PubSubTraceAttributeValue>;
+
+/** Minimal span status shape for package-neutral tracer adapters. */
+export interface PubSubTraceStatus {
+  code: 'ok' | 'error';
+  message?: string;
+}
+
+/**
+ * Minimal span contract used by {@link PubSubTracer}. This intentionally avoids
+ * importing a telemetry SDK; callers can adapt it to OpenTelemetry or any other
+ * tracing implementation.
+ */
+export interface PubSubTraceSpan {
+  setAttribute?: (name: string, value: PubSubTraceAttributeValue) => void;
+  setAttributes?: (attributes: PubSubTraceAttributes) => void;
+  recordException?: (error: unknown) => void;
+  setStatus?: (status: PubSubTraceStatus) => void;
+  end?: () => void;
+}
+
+/**
+ * Optional tracer injected into {@link PostgresPubSub}. The adapter emits
+ * payload-safe spans and events and swallows tracer failures so instrumentation
+ * cannot affect PubSub behavior.
+ */
+export interface PubSubTracer {
+  startSpan?: (name: string, attributes: PubSubTraceAttributes) => PubSubTraceSpan | undefined;
+  event?: (name: string, attributes: PubSubTraceAttributes) => void;
+}
+
 /**
  * Configuration for {@link PostgresPubSub}.
  *
@@ -101,6 +136,8 @@ export interface PostgresPubSubConfig {
   deadLetter?: boolean;
   /** Optional logger; silent when omitted. */
   logger?: PubSubLogger;
+  /** Optional tracer; silent when omitted. */
+  tracer?: PubSubTracer;
 }
 
 /**
@@ -119,4 +156,5 @@ export interface ResolvedConfig {
   listen: boolean;
   deadLetter: boolean;
   logger: PubSubLogger;
+  tracer: PubSubTracer;
 }

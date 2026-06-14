@@ -1,5 +1,13 @@
 import type { Event, EventCallback } from '@mastra/core/events';
 import type { Pool } from 'pg';
+import {
+  logDebug,
+  logError,
+  logWarn,
+  startTraceSpan,
+  traceAttributes,
+  traceEvent,
+} from './observability.ts';
 import { quoteIdentifier } from './sql.ts';
 import type { ResolvedConfig } from './types.ts';
 
@@ -82,12 +90,24 @@ export class ConsumeLoop {
     return `${quoteIdentifier(this.#schema)}.${quoteIdentifier(table)}`;
   }
 
+  #baseAttributes(extra: Record<string, string | number | boolean | null | undefined> = {}) {
+    return traceAttributes({
+      topic: this.#topic,
+      subscriptionId: this.#subscriptionId,
+      subscriptionKind: this.#isGroup ? 'group' : 'private',
+      ...extra,
+    });
+  }
+
   /** Start the background loop. Safe to call once. */
   start(): void {
     if (this.#loopPromise) {
       return;
     }
     this.#loopPromise = this.#run();
+    const context = this.#baseAttributes();
+    logDebug(this.#config.logger, 'consume loop started', context);
+    traceEvent(this.#config.tracer, 'pg_pubsub.consume.started', context);
   }
 
   /** Request an immediate poll (used by NOTIFY wakeups). */
@@ -98,6 +118,7 @@ export class ConsumeLoop {
       this.#wake = undefined;
       fn();
     }
+    traceEvent(this.#config.tracer, 'pg_pubsub.consume.wake', this.#baseAttributes());
   }
 
   /**
@@ -117,7 +138,7 @@ export class ConsumeLoop {
         delivered = await this.#tick();
       } catch (error) {
         if (!this.#stopped) {
-          this.#config.logger.error?.('consume loop tick failed', error);
+          logError(this.#config.logger, 'consume loop tick failed', this.#baseAttributes(), error);
         }
       }
       if (this.#stopped) {
@@ -173,6 +194,11 @@ export class ConsumeLoop {
     if (rows.length === 0) {
       return 0;
     }
+    const claimContext = this.#baseAttributes({
+      deliveryCount: rows.length,
+    });
+    logDebug(this.#config.logger, 'claimed deliveries', claimContext);
+    traceEvent(this.#config.tracer, 'pg_pubsub.consume.claimed', claimContext);
     this.#armIdle();
     for (const row of rows) {
       if (this.#stopped) {
@@ -218,6 +244,17 @@ export class ConsumeLoop {
     }
     const callback = this.#nextCallback();
     if (!callback) {
+      logWarn(
+        this.#config.logger,
+        'delivery claimed without callback',
+        this.#baseAttributes({
+          eventId: row.event_id,
+          eventType: row.type,
+          eventIndex: Number(row.index),
+          runId: row.run_id,
+          deliveryAttempt: row.delivery_attempt,
+        }),
+      );
       return;
     }
     const event: Event = {
@@ -229,6 +266,14 @@ export class ConsumeLoop {
       index: Number(row.index),
       deliveryAttempt: row.delivery_attempt,
     };
+    const deliveryContext = this.#baseAttributes({
+      eventId: event.id,
+      eventType: event.type,
+      eventIndex: event.index,
+      runId: event.runId,
+      deliveryAttempt: event.deliveryAttempt,
+    });
+    const span = startTraceSpan(this.#config.tracer, 'pg_pubsub.delivery', deliveryContext);
 
     this.#inFlight++;
     let settled = false;
@@ -238,6 +283,17 @@ export class ConsumeLoop {
       }
       settled = true;
       await this.#ack(row.seq);
+      const context = this.#baseAttributes({
+        eventId: event.id,
+        eventType: event.type,
+        eventIndex: event.index,
+        runId: event.runId,
+        deliveryAttempt: event.deliveryAttempt,
+        settlement: 'ack',
+      });
+      logDebug(this.#config.logger, 'delivery acked', context);
+      traceEvent(this.#config.tracer, 'pg_pubsub.delivery.acked', context);
+      span.setAttribute('delivery.settlement', 'ack');
     };
     const nack = async (): Promise<void> => {
       if (settled) {
@@ -245,14 +301,34 @@ export class ConsumeLoop {
       }
       settled = true;
       await this.#nack(row.seq);
+      const context = this.#baseAttributes({
+        eventId: event.id,
+        eventType: event.type,
+        eventIndex: event.index,
+        runId: event.runId,
+        deliveryAttempt: event.deliveryAttempt,
+        settlement: 'nack',
+        nackDelayMs: this.#config.nackDelayMs,
+      });
+      logDebug(this.#config.logger, 'delivery nacked', context);
+      traceEvent(this.#config.tracer, 'pg_pubsub.delivery.nacked', context);
+      span.setAttribute('delivery.settlement', 'nack');
     };
 
+    let callbackFailed = false;
     try {
+      logDebug(this.#config.logger, 'delivery started', deliveryContext);
       await callback(event, ack, nack);
     } catch (error) {
-      this.#config.logger.error?.('subscriber callback threw', error);
+      callbackFailed = true;
+      logError(this.#config.logger, 'subscriber callback threw', deliveryContext, error);
+      span.recordError(error);
     } finally {
       this.#inFlight--;
+      span.setAttribute('delivery.settled', settled);
+      span.end(
+        callbackFailed ? { code: 'error', message: 'subscriber callback threw' } : undefined,
+      );
       this.#markIdle();
     }
   }
@@ -288,11 +364,21 @@ export class ConsumeLoop {
   }
 
   async #dropExhausted(row: ClaimedRow): Promise<void> {
-    this.#config.logger.warn?.(
-      `dropping event ${row.event_id} on subscription ${this.#subscriptionId} after ${
-        row.delivery_attempt - 1
-      } attempts`,
+    const attempts = row.delivery_attempt - 1;
+    const context = this.#baseAttributes({
+      eventId: row.event_id,
+      eventType: row.type,
+      eventIndex: Number(row.index),
+      runId: row.run_id,
+      deliveryAttempt: attempts,
+      deadLetter: this.#config.deadLetter,
+    });
+    logWarn(
+      this.#config.logger,
+      `dropping event ${row.event_id} on subscription ${this.#subscriptionId} after ${attempts} attempts`,
+      context,
     );
+    traceEvent(this.#config.tracer, 'pg_pubsub.delivery.dropped', context);
     if (this.#config.deadLetter) {
       await this.#pool.query(
         `INSERT INTO ${this.#q('dead_events')}
@@ -322,5 +408,8 @@ export class ConsumeLoop {
       // #run() swallows tick errors internally, so this never rejects.
       await this.#loopPromise;
     }
+    const context = this.#baseAttributes();
+    logDebug(this.#config.logger, 'consume loop stopped', context);
+    traceEvent(this.#config.tracer, 'pg_pubsub.consume.stopped', context);
   }
 }

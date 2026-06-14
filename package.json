@@ -44,8 +44,8 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
-    "test": "node --test 'test/*.test.ts'",
-    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-lines=95 --test-coverage-functions=95 --test-coverage-branches=90 'test/*.test.ts'",
+    "test": "node --test --test-concurrency=1 'test/*.test.ts'",
+    "test:coverage": "node --test --test-concurrency=1 --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-lines=95 --test-coverage-functions=95 --test-coverage-branches=90 'test/*.test.ts'",
     "db:up": "docker compose up -d --wait",
     "db:down": "docker compose down -v",
     "test:e2e": "node --env-file-if-exists=.env --test 'test/e2e/*.test.ts'"

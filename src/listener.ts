@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from 'pg';
+import { logDebug, logWarn, startTraceSpan, traceAttributes, traceEvent } from './observability.ts';
 import { notifyChannel, quoteIdentifier } from './sql.ts';
-import type { PubSubLogger } from './types.ts';
+import type { PubSubLogger, PubSubTracer } from './types.ts';
 
 /**
  * Owns a single dedicated `LISTEN` connection and dispatches `NOTIFY` payloads
@@ -12,6 +13,7 @@ export class NotifyListener {
   readonly #pool: Pool;
   readonly #channel: string;
   readonly #logger: PubSubLogger;
+  readonly #tracer: PubSubTracer;
   readonly #handlers = new Map<string, Set<() => void>>();
   #client: PoolClient | undefined;
   #connecting: Promise<void> | undefined;
@@ -21,11 +23,13 @@ export class NotifyListener {
    * @param pool - Pool used to acquire the dedicated listen connection.
    * @param schema - Validated schema name; determines the channel.
    * @param logger - Logger for connection diagnostics.
+   * @param tracer - Tracer for listener lifecycle diagnostics.
    */
-  constructor(pool: Pool, schema: string, logger: PubSubLogger) {
+  constructor(pool: Pool, schema: string, logger: PubSubLogger, tracer: PubSubTracer) {
     this.#pool = pool;
     this.#channel = notifyChannel(schema);
     this.#logger = logger;
+    this.#tracer = tracer;
   }
 
   /**
@@ -44,6 +48,14 @@ export class NotifyListener {
     }
     set.add(handler);
     await this.#ensureConnected();
+    const context = traceAttributes({
+      channel: this.#channel,
+      topic,
+      topicHandlerCount: set.size,
+      topicCount: this.#handlers.size,
+    });
+    logDebug(this.#logger, 'listen handler registered', context);
+    traceEvent(this.#tracer, 'pg_pubsub.listener.handler_registered', context);
     return () => {
       const current = this.#handlers.get(topic);
       if (current) {
@@ -51,6 +63,14 @@ export class NotifyListener {
         if (current.size === 0) {
           this.#handlers.delete(topic);
         }
+        const unregisterContext = traceAttributes({
+          channel: this.#channel,
+          topic,
+          topicHandlerCount: current.size,
+          topicCount: this.#handlers.size,
+        });
+        logDebug(this.#logger, 'listen handler unregistered', unregisterContext);
+        traceEvent(this.#tracer, 'pg_pubsub.listener.handler_unregistered', unregisterContext);
       }
     };
   }
@@ -68,29 +88,75 @@ export class NotifyListener {
   }
 
   async #connect(): Promise<void> {
+    const span = startTraceSpan(
+      this.#tracer,
+      'pg_pubsub.listener.connect',
+      traceAttributes({
+        channel: this.#channel,
+        topicCount: this.#handlers.size,
+      }),
+    );
     const client = await this.#pool.connect();
-    client.on('notification', (msg) => {
-      if (msg.payload === undefined) {
+    try {
+      client.on('notification', (msg) => {
+        if (msg.payload === undefined) {
+          return;
+        }
+        const handlers = this.#handlers.get(msg.payload);
+        const context = traceAttributes({
+          channel: this.#channel,
+          topic: msg.payload,
+          handlerCount: handlers?.size ?? 0,
+        });
+        logDebug(this.#logger, 'notification received', context);
+        traceEvent(this.#tracer, 'pg_pubsub.listener.notification', context);
+        if (handlers) {
+          for (const handler of handlers) {
+            handler();
+          }
+        }
+      });
+      client.on('error', (error) => {
+        logDebug(
+          this.#logger,
+          'listen connection error',
+          traceAttributes({
+            channel: this.#channel,
+          }),
+        );
+        traceEvent(
+          this.#tracer,
+          'pg_pubsub.listener.error',
+          traceAttributes({
+            channel: this.#channel,
+            errorName: error.name,
+          }),
+        );
+        this.#handleDisconnect(client);
+      });
+      await client.query(`LISTEN ${quoteIdentifier(this.#channel)}`);
+      if (this.#closed) {
+        client.removeAllListeners('notification');
+        client.release();
+        span.setAttribute('listener.closed_before_ready', true);
+        span.end();
         return;
       }
-      const handlers = this.#handlers.get(msg.payload);
-      if (handlers) {
-        for (const handler of handlers) {
-          handler();
-        }
-      }
-    });
-    client.on('error', (error) => {
-      this.#logger.debug?.('listen connection error', error);
-      this.#handleDisconnect(client);
-    });
-    await client.query(`LISTEN ${quoteIdentifier(this.#channel)}`);
-    if (this.#closed) {
+      this.#client = client;
+      const context = traceAttributes({
+        channel: this.#channel,
+        topicCount: this.#handlers.size,
+      });
+      logDebug(this.#logger, 'listen connection established', context);
+      span.end();
+    } catch (error) {
       client.removeAllListeners('notification');
+      client.removeAllListeners('error');
       client.release();
-      return;
+      span.recordError(error);
+      span.end({ code: 'error', message: 'listen connection failed' });
+      throw error;
     }
-    this.#client = client;
   }
 
   #handleDisconnect(client: PoolClient): void {
@@ -100,11 +166,25 @@ export class NotifyListener {
     this.#client = undefined;
     client.removeAllListeners('notification');
     client.release(true);
+    const context = traceAttributes({
+      channel: this.#channel,
+      topicCount: this.#handlers.size,
+    });
+    logDebug(this.#logger, 'listen connection disconnected', context);
+    traceEvent(this.#tracer, 'pg_pubsub.listener.disconnected', context);
     if (this.#closed || this.#handlers.size === 0) {
       return;
     }
     this.#ensureConnected().catch((error) => {
-      this.#logger.warn?.('listen reconnect failed', error);
+      logWarn(
+        this.#logger,
+        'listen reconnect failed',
+        traceAttributes({
+          channel: this.#channel,
+          topicCount: this.#handlers.size,
+        }),
+        error,
+      );
     });
   }
 
@@ -112,6 +192,14 @@ export class NotifyListener {
    * Release the listen connection and stop dispatching. Idempotent.
    */
   async close(): Promise<void> {
+    const span = startTraceSpan(
+      this.#tracer,
+      'pg_pubsub.listener.close',
+      traceAttributes({
+        channel: this.#channel,
+        topicCount: this.#handlers.size,
+      }),
+    );
     this.#closed = true;
     this.#handlers.clear();
     if (this.#connecting) {
@@ -129,5 +217,13 @@ export class NotifyListener {
       }
       client.release();
     }
+    logDebug(
+      this.#logger,
+      'listen connection closed',
+      traceAttributes({
+        channel: this.#channel,
+      }),
+    );
+    span.end();
   }
 }

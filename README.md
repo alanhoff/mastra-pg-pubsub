@@ -107,7 +107,59 @@ Provide exactly one of `connectionString` or `pool`.
 | `staleSubscriptionMs` | `300000` | Age before stale private subscriptions are pruned. |
 | `listen` | `true` | Enable `LISTEN/NOTIFY` wakeups. `false` uses polling only. |
 | `deadLetter` | `false` | Copy exhausted events to `dead_events`. |
-| `logger` | silent | Optional `debug`, `warn`, and `error` functions. |
+| `logger` | silent | Optional `debug`, `warn`, and `error` functions with structured context. |
+| `tracer` | silent | Optional package-neutral tracing hooks for spans and events. |
+
+## Observability
+
+`logger` and `tracer` are both optional and silent by default. They are called with
+payload-safe context only: topics, event ids, event types, indexes, run ids,
+subscription ids/kinds, attempts, counts, status, and durations. Event `data`,
+connection strings, raw database rows, and arbitrary payload objects are not logged
+or traced.
+
+Logger and tracer failures are isolated from PubSub behavior. If an observability
+sink throws, publishing, subscribing, delivery, ack/nack, replay, flush, listener
+wakeups, and close continue normally. Error telemetry is sanitized to scalar
+metadata such as `error.name`; raw thrown values and error messages are not passed
+to observability sinks.
+
+```ts
+const pubsub = new PostgresPubSub({
+  connectionString: process.env.DATABASE_URL,
+  logger: {
+    debug: (message, context) => console.debug(message, context),
+    warn: (message, context) => console.warn(message, context),
+    error: (message, context) => console.error(message, context),
+  },
+  tracer: {
+    event: (name, attributes) => {
+      console.debug('trace event', name, attributes);
+    },
+    startSpan: (name, attributes) => {
+      const startedAt = Date.now();
+      return {
+        setAttribute: (key, value) => {
+          console.debug('trace attr', name, key, value);
+        },
+        recordException: (error) => {
+          console.error('trace error', name, error);
+        },
+        setStatus: (status) => {
+          console.debug('trace status', name, status);
+        },
+        end: () => {
+          console.debug('trace span end', name, Date.now() - startedAt, attributes);
+        },
+      };
+    },
+  },
+});
+```
+
+Trace names use the `pg_pubsub.*` prefix, including spans such as
+`pg_pubsub.publish`, `pg_pubsub.delivery`, `pg_pubsub.flush`, and listener or
+maintenance lifecycle spans.
 
 ## Delivery guarantees
 
