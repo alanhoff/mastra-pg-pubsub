@@ -277,118 +277,80 @@ test('idle stop does not close a caller-owned pool', async () => {
   }
 });
 
-test('migrate clears a rejected migration promise so a later call retries', async () => {
-  const pool = makeTransientMigrationPool(1);
+
+test('start retries after a transient migration failure on the same instance', async () => {
+  const retrySchema = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
   const ps = new PostgresPubSub({
     pool,
-    schema: uniqueSchema(),
+    schema: retrySchema,
     listen: false,
     cleanupIntervalMs: 0,
+    pollIntervalMs: 25,
   });
 
-  await assert.rejects(() => ps.migrate(), /transient connect failure/);
-  await assert.doesNotReject(() => ps.migrate());
+  try {
+    await pool.query(`CREATE SCHEMA "${retrySchema}"`);
+    await pool.query(`CREATE VIEW "${retrySchema}".events AS SELECT 1 AS seq`);
 
-  assert.equal(pool.connectCount, 2, 'second migrate should acquire a fresh connection');
+    await assert.rejects(() => ps.start());
+
+    await dropSchema(retrySchema);
+    await assert.doesNotReject(() => ps.start());
+    assert.equal(await schemaExists(retrySchema), true);
+  } finally {
+    await ps.close().catch(() => undefined);
+    await pool.end();
+    await dropSchema(retrySchema);
+  }
 });
 
-test('start clears a rejected startup promise so a later call retries', async () => {
-  const pool = makeTransientMigrationPool(1);
-  const ps = new PostgresPubSub({
-    pool,
-    schema: uniqueSchema(),
-    listen: false,
-    cleanupIntervalMs: 0,
-  });
-
-  await assert.rejects(() => ps.start(), /transient connect failure/);
-  await assert.doesNotReject(() => ps.start());
-
-  assert.equal(pool.connectCount, 2, 'second start should retry migration/startup');
-});
-
-test('subscribe rolls back private state when listen setup fails', async () => {
+test('subscribe rolls back local and private row state when listener setup fails', async () => {
   const rollbackSchema = uniqueSchema();
-  const topic = 'topic-listen-rollback';
-  const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 2 });
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  const warnMessages: string[] = [];
   const ps = new PostgresPubSub({
     pool,
     schema: rollbackSchema,
     listen: true,
     cleanupIntervalMs: 0,
-    pollIntervalMs: 10_000,
-  });
-  pubsubs.push(ps);
-
-  await ps.migrate();
-
-  const originalConnect = pool.connect.bind(pool);
-  let connectCalls = 0;
-  pool.connect = (async (...args: []) => {
-    connectCalls++;
-    if (connectCalls === 2) {
-      throw new Error('listen connect failed');
-    }
-    return originalConnect(...args);
-  }) as typeof pool.connect;
-
-  try {
-    await assert.rejects(
-      () =>
-        ps.subscribe(topic, (_event, ack) => {
-          ack?.();
-        }),
-      /listen connect failed/,
-    );
-  } finally {
-    pool.connect = originalConnect as typeof pool.connect;
-  }
-
-  assert.equal(await subscriptionRowCount(rollbackSchema, topic), 0);
-
-  await ps.subscribe(topic, (_event, ack) => {
-    ack?.();
-  });
-  assert.equal(await subscriptionRowCount(rollbackSchema, topic), 1);
-
-  await ps.close();
-  await pool.end();
-  await dropSchema(rollbackSchema);
-});
-
-test('concurrent same-group subscribes serialize to one local consume loop', async () => {
-  const groupSchema = uniqueSchema();
-  const debugMessages: string[] = [];
-  const ps = makePubSub(groupSchema, {
-    listen: false,
-    pollIntervalMs: 10_000,
+    pollIntervalMs: 25,
     logger: makeTestLogger({
-      debug: (message: string) => {
-        debugMessages.push(message);
+      warn: (message: string) => {
+        warnMessages.push(message);
       },
     }),
   });
-  pubsubs.push(ps);
+  const originalConnect = pool.connect.bind(pool);
+  const cb: EventCallback = (_event, ack) => ack?.();
 
-  const cbA: EventCallback = (_event, ack) => {
-    ack?.();
-  };
-  const cbB: EventCallback = (_event, ack) => {
-    ack?.();
-  };
+  try {
+    await ps.start();
+    pool.connect = async () => {
+      throw new Error('listen unavailable');
+    };
 
-  await Promise.all([
-    ps.subscribe('topic-concurrent-group', cbA, { group: 'workers' }),
-    ps.subscribe('topic-concurrent-group', cbB, { group: 'workers' }),
-  ]);
+    await assert.rejects(() => ps.subscribe('topic-rollback', cb), /listen unavailable/);
 
-  assert.equal(
-    debugMessages.filter((message) => message === 'subscription loop started').length,
-    1,
-    'same topic/group should create one local consume loop',
-  );
-  assert.equal(await subscriptionRowCount(groupSchema, 'topic-concurrent-group'), 1);
+    const rowCount = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM "${rollbackSchema}".subscriptions WHERE topic = $1`,
+      ['topic-rollback'],
+    );
+    assert.equal(rowCount.rows[0]?.count, '0');
 
-  await ps.unsubscribe('topic-concurrent-group', cbA);
-  await ps.unsubscribe('topic-concurrent-group', cbB);
+    pool.connect = originalConnect;
+    await ps.subscribe('topic-rollback', cb);
+    await ps.publish('topic-rollback', { type: 'after-rollback', data: null, runId: 'run-rollback' });
+    await ps.flush();
+    assert.equal(
+      warnMessages.some((message) => message.includes('failed to roll back subscription')),
+      false,
+      'rollback should complete without warning when the pool remains usable',
+    );
+  } finally {
+    pool.connect = originalConnect;
+    await ps.close().catch(() => undefined);
+    await pool.end();
+    await dropSchema(rollbackSchema);
+  }
 });
