@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import type { EventCallback } from '@mastra/core/events';
-import type { Pool, QueryResult, QueryResultRow } from 'pg';
 import pg from 'pg';
 import { PostgresPubSub } from '../src/index.ts';
 import {
@@ -14,62 +13,6 @@ import {
   uniqueSchema,
   waitFor,
 } from './helpers.ts';
-
-interface FakeClient {
-  query<T extends QueryResultRow = QueryResultRow>(sql: string): Promise<QueryResult<T>>;
-  release(): void;
-}
-
-class RetryMigrationPool {
-  connectCount = 0;
-  readonly #failFirstConnect: boolean;
-
-  constructor({ failFirstConnect }: { failFirstConnect: boolean }) {
-    this.#failFirstConnect = failFirstConnect;
-  }
-
-  async connect(): Promise<FakeClient> {
-    this.connectCount++;
-    if (this.#failFirstConnect && this.connectCount === 1) {
-      throw new Error('transient connect failure');
-    }
-    return {
-      query: async <T extends QueryResultRow = QueryResultRow>(sql: string) => {
-        const rows = sql.includes('to_regnamespace') ? [{ exists: true }] : [];
-        return { rows } as unknown as QueryResult<T>;
-      },
-      release: () => undefined,
-    };
-  }
-
-  async query<T extends QueryResultRow = QueryResultRow>(): Promise<QueryResult<T>> {
-    return { rows: [] } as unknown as QueryResult<T>;
-  }
-}
-
-class FailingListenPool {
-  connectCount = 0;
-  readonly queries: string[] = [];
-
-  async connect(): Promise<FakeClient> {
-    this.connectCount++;
-    if (this.connectCount === 2) {
-      throw new Error('listen connect failure');
-    }
-    return {
-      query: async <T extends QueryResultRow = QueryResultRow>(sql: string) => {
-        const rows = sql.includes('to_regnamespace') ? [{ exists: true }] : [];
-        return { rows } as unknown as QueryResult<T>;
-      },
-      release: () => undefined,
-    };
-  }
-
-  async query<T extends QueryResultRow = QueryResultRow>(sql: string): Promise<QueryResult<T>> {
-    this.queries.push(sql);
-    return { rows: [], rowCount: sql.startsWith('DELETE') ? 1 : 0 } as unknown as QueryResult<T>;
-  }
-}
 
 const schema = uniqueSchema();
 const pubsubs: Array<{ close(): Promise<void> }> = [];
