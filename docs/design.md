@@ -36,12 +36,6 @@ dead_events    optional copy of event + subscription + attempts when deadLetter 
 
 PostgreSQL reserves the `pg_` prefix. When the default schema is absent, the migration enables the session flag needed to create this package-owned schema; when the schema already exists, ordinary roles only need table-creation privileges inside it. Other custom `pg_` names are rejected; users can select an ordinary schema name when their database policy requires one. Production least-privilege deployments should run `migrate()` from a release/migration role and run app workers with DML privileges on the pre-created schema rather than broad runtime DDL privileges.
 
-Production deployments should separate migration and runtime privilege when possible: a deploy-time migration role runs `migrate()` or equivalent SQL, while the long-lived application role only needs DML privileges on the package tables. Runtime auto-migration remains a convenience path for development and simple deployments, not a requirement to grant DDL privileges to every application process.
-
-Production deployments should separate migration and runtime privilege when possible: a deploy-time migration role runs `migrate()` or equivalent SQL, while the long-lived application role only needs DML privileges on the package tables. Runtime auto-migration remains a convenience path for development and simple deployments, not a requirement to grant DDL privileges to every application process.
-
-Production deployments should separate migration and runtime privilege when possible: a deploy-time migration role runs `migrate()` or equivalent SQL, while the long-lived application role only needs DML privileges on the package tables. Runtime auto-migration remains a convenience path for development and simple deployments, not a requirement to grant DDL privileges to every application process.
-
 ## Data Flow
 
 ```mermaid
