@@ -720,3 +720,112 @@ test('flush surfaces database failures while counting pending deliveries', async
     await dropSchema(schemaFlushFailure);
   }
 });
+
+test('failed automatic ack is logged and delivery remains recoverable by deadline', async () => {
+  const schemaAutoAckFailure = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  const errorMessages: string[] = [];
+  const ps = new PostgresPubSub({
+    pool,
+    schema: schemaAutoAckFailure,
+    ackDeadlineMs: 150,
+    pollIntervalMs: 25,
+    cleanupIntervalMs: 0,
+    logger: makeTestLogger({
+      error: (message: string) => {
+        errorMessages.push(message);
+      },
+    }),
+  });
+  const originalQuery = pool.query.bind(pool) as typeof pool.query;
+  let failedAck = false;
+  pool.query = ((queryText: unknown, values?: unknown) => {
+    if (
+      !failedAck &&
+      typeof queryText === 'string' &&
+      queryText.includes('DELETE FROM') &&
+      queryText.includes('deliveries') &&
+      queryText.includes('subscription_id = $1') &&
+      !queryText.includes('USING')
+    ) {
+      failedAck = true;
+      return Promise.reject(new Error('forced auto ack failure'));
+    }
+    return originalQuery(queryText as never, values as never);
+  }) as typeof pool.query;
+
+  const attempts: number[] = [];
+  try {
+    await ps.subscribe('topic-auto-ack-failure', (event) => {
+      attempts.push(event.deliveryAttempt ?? 0);
+    });
+    await ps.publish('topic-auto-ack-failure', { type: 'e', data: null, runId: 'r' });
+    await waitFor(() => attempts.length >= 2, { timeoutMs: 5000 });
+    await ps.flush();
+
+    assert.equal(failedAck, true);
+    assert.deepEqual(attempts, [1, 2]);
+    assert.ok(errorMessages.includes('automatic delivery ack failed'));
+  } finally {
+    pool.query = originalQuery as typeof pool.query;
+    await ps.close().catch(() => undefined);
+    await pool.end().catch(() => undefined);
+    await dropSchema(schemaAutoAckFailure);
+  }
+});
+
+test('failed automatic nack is logged and delivery remains recoverable by deadline', async () => {
+  const schemaAutoNackFailure = uniqueSchema();
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  const errorMessages: string[] = [];
+  const ps = new PostgresPubSub({
+    pool,
+    schema: schemaAutoNackFailure,
+    ackDeadlineMs: 150,
+    pollIntervalMs: 25,
+    cleanupIntervalMs: 0,
+    logger: makeTestLogger({
+      error: (message: string) => {
+        errorMessages.push(message);
+      },
+    }),
+  });
+  const originalQuery = pool.query.bind(pool) as typeof pool.query;
+  let failedNack = false;
+  pool.query = ((queryText: unknown, values?: unknown) => {
+    if (
+      !failedNack &&
+      typeof queryText === 'string' &&
+      queryText.includes('UPDATE') &&
+      queryText.includes('deliveries') &&
+      queryText.includes('SET visible_at') &&
+      !queryText.includes('delivery_attempt')
+    ) {
+      failedNack = true;
+      return Promise.reject(new Error('forced auto nack failure'));
+    }
+    return originalQuery(queryText as never, values as never);
+  }) as typeof pool.query;
+
+  const attempts: number[] = [];
+  try {
+    await ps.subscribe('topic-auto-nack-failure', (event) => {
+      attempts.push(event.deliveryAttempt ?? 0);
+      if (attempts.length === 1) {
+        throw new Error('first attempt fails');
+      }
+    });
+    await ps.publish('topic-auto-nack-failure', { type: 'e', data: null, runId: 'r' });
+    await waitFor(() => attempts.length >= 2, { timeoutMs: 5000 });
+    await ps.flush();
+
+    assert.equal(failedNack, true);
+    assert.deepEqual(attempts, [1, 2]);
+    assert.ok(errorMessages.includes('automatic delivery nack failed'));
+  } finally {
+    pool.query = originalQuery as typeof pool.query;
+    await ps.close().catch(() => undefined);
+    await pool.end().catch(() => undefined);
+    await dropSchema(schemaAutoNackFailure);
+  }
+});

@@ -1,2 +1,2 @@
 export { PostgresPubSub } from './postgres-pubsub.ts';
-export type { PostgresPubSubConfig } from './types.ts';
+export type { PostgresPubSubConfig, SettlementPolicy } from './types.ts';

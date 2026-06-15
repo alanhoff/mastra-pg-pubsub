@@ -382,20 +382,30 @@ test('delivery callbacks execute inside the delivery span context', async () => 
   const ps = makePubSub(uniqueSchema(), { pollIntervalMs: 25 });
   pubsubs.push(ps);
   const received: string[] = [];
-  await ps.subscribe('topic-delivery', (event, ack) => {
+  await ps.subscribe('topic-delivery', (event) => {
     received.push(event.type);
-    ack?.();
   });
 
   await ps.publish('topic-delivery', { type: 'delivered', data: null, runId: 'run-delivery' });
   await waitFor(() => received.includes('delivered'));
+  await waitFor(() =>
+    root.record.children.some(
+      (child) =>
+        child.record.name === 'pg_pubsub.delivery' &&
+        child.record.attributes['delivery.auto_settlement'] === 'ack' &&
+        child.record.ended,
+    ),
+  );
 
   assert.equal(deliveryContextSeen, true);
   assert.ok(
     root.record.children.some(
       (child) =>
         child.record.name === 'pg_pubsub.delivery' &&
+        child.record.attributes['delivery.settlement_policy'] === 'mastra-compatible' &&
+        child.record.attributes['delivery.auto_settlement'] === 'ack' &&
         child.record.attributes['delivery.settlement'] === 'ack' &&
+        child.record.attributes['delivery.settled'] === true &&
         child.record.ended,
     ),
   );

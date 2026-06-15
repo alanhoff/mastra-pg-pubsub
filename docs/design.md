@@ -62,8 +62,9 @@ Subscribers created after publish do not receive prior events, but can get them 
 - `options.group` set: shared subscription row derived from `(topic, group)`; each event reaches exactly one group member through `FOR UPDATE SKIP LOCKED`.
 - No group: private subscription row (`__private:<instanceId>:<uuid>`); each callback receives every event published after it subscribes.
 - One consume loop exists per `(topic, subscription id)`.
-- `ack()` deletes the delivery row. `nack()` makes it visible again after `nackDelayMs`.
-- Missing settlement causes redelivery after `ackDeadlineMs`.
+- `ack()` deletes the delivery row. `nack()` makes it visible again after `nackDelayMs`; repeated external failures should use a non-zero delay to avoid immediate retry pressure.
+- Settlement follows `settlement`: `mastra-compatible` auto-acks successful private/fan-out callbacks, `explicit` requires ack/nack everywhere, and `callback-success` auto-acks successful private and group callbacks.
+- Pending deliveries redeliver after `ackDeadlineMs`.
 - `delivery_attempt > maxDeliveryAttempts` drops the event and optionally copies it to `dead_events`.
 
 ## Lifecycle
@@ -78,7 +79,7 @@ Subscribers created after publish do not receive prior events, but can get them 
 ## Replay
 
 - `getHistory(topic, offset = 0)` returns events ordered by per-topic `index`.
-- `subscribeWithReplay` and `subscribeFromOffset` create the live subscription row first, replay history while the consume loop is paused, settle replayed delivery rows, then start live delivery.
+- `subscribeWithReplay` and `subscribeFromOffset` create the live subscription row first, replay history while the consume loop is paused, settle replayed delivery rows, then start live delivery. Live rows created after setup use the configured settlement policy.
 - Setup failures clean up the paused private subscription.
 
 ## Configuration
@@ -98,6 +99,7 @@ interface PostgresPubSubConfig {
   staleSubscriptionMs?: number; // positive safe integer
   listen?: boolean;
   deadLetter?: boolean;
+  settlement?: 'mastra-compatible' | 'explicit' | 'callback-success';
   logger?: IMastraLogger | false;
 }
 ```
@@ -118,7 +120,7 @@ Emitted context is allow-listed scalar metadata such as topic, event id/type/ind
 
 | Property | Guarantee |
 | --- | --- |
-| Delivery | At least once; `ack()` settles, missing ack redelivers after `ackDeadlineMs`. |
+| Delivery | At least once; settlement follows `settlement`, manual `ack()` settles, and pending deliveries redeliver after `ackDeadlineMs`. |
 | Ordering | Per topic by `index`; retries may interleave with newer events. |
 | Groups | Each event delivered to exactly one member per group. |
 | Fan-out | Every groupless subscriber receives every event published after subscription. |

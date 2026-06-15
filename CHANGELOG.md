@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented here.
 
+## 0.4.0 - 2026-06-15
+
+### Added
+
+- Added the `settlement` option with `mastra-compatible`, `explicit`, and `callback-success` policies.
+
+### Changed
+
+- Changed the default callback settlement policy to Mastra-compatible behavior: successful private/fan-out callbacks auto-ack after the returned callback promise resolves, while consumer groups remain explicit by default.
+- Changed unsettled callback failures under the default and `callback-success` policies to auto-nack instead of waiting for the visibility timeout. Use `settlement: 'explicit'` to keep strict ack/nack-only settlement everywhere.
+- Documented non-zero `nackDelayMs` guidance for callbacks that can repeatedly fail on external dependencies.
+
 ## 0.3.0 - 2026-06-14
 
 ### Changed

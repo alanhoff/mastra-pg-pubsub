@@ -3,7 +3,7 @@ import { after, test } from 'node:test';
 import type { Event } from '@mastra/core/events';
 import pg from 'pg';
 import { PostgresPubSub } from '../src/index.ts';
-import { DATABASE_URL, dropSchema, makePubSub, uniqueSchema, waitFor } from './helpers.ts';
+import { DATABASE_URL, dropSchema, makePubSub, sleep, uniqueSchema, waitFor } from './helpers.ts';
 
 const schema = uniqueSchema();
 const pubsubs: Array<{ close(): Promise<void> }> = [];
@@ -161,6 +161,62 @@ test('subscribeFromOffset preserves history order before events published during
   await ps.flush();
 
   assert.deepEqual(received, [0, 1, 2, 3]);
+});
+
+test('subscribeWithReplay live event-only callbacks auto-settle by default', async () => {
+  const ps = makePubSub(schema, { ackDeadlineMs: 200, pollIntervalMs: 25 });
+  pubsubs.push(ps);
+
+  await ps.publish('topic-replay-event-only', { type: 'history', data: 0, runId: 'history' });
+
+  const received: number[] = [];
+  await ps.subscribeWithReplay('topic-replay-event-only', (event) => {
+    if (event.index !== undefined) received.push(event.index);
+  });
+
+  await ps.publish('topic-replay-event-only', { type: 'live', data: 1, runId: 'live' });
+  await waitFor(() => received.includes(1), { timeoutMs: 5000 });
+  await ps.flush();
+  await sleep(300);
+
+  assert.deepEqual(received, [0, 1]);
+});
+
+test('CachingPubSub-shaped wrapper does not prevent default private auto-settlement', async () => {
+  const ps = makePubSub(schema, { ackDeadlineMs: 200, pollIntervalMs: 25 });
+  pubsubs.push(ps);
+
+  let count = 0;
+  const original = async (_event: Event, _ack?: () => Promise<void>) => {
+    count++;
+  };
+  await ps.subscribe('topic-caching-wrapper-shape', (event, ack) => original(event, ack));
+
+  await ps.publish('topic-caching-wrapper-shape', { type: 'live', data: null, runId: 'live' });
+  await ps.flush();
+  await sleep(300);
+
+  assert.equal(count, 1);
+});
+
+test('subscribeFromOffset live event-only callbacks auto-settle by default', async () => {
+  const ps = makePubSub(schema, { ackDeadlineMs: 200, pollIntervalMs: 25 });
+  pubsubs.push(ps);
+
+  await ps.publish('topic-offset-event-only', { type: 'history', data: 0, runId: 'history-0' });
+  await ps.publish('topic-offset-event-only', { type: 'history', data: 1, runId: 'history-1' });
+
+  const received: number[] = [];
+  await ps.subscribeFromOffset('topic-offset-event-only', 1, (event) => {
+    if (event.index !== undefined) received.push(event.index);
+  });
+
+  await ps.publish('topic-offset-event-only', { type: 'live', data: 2, runId: 'live-2' });
+  await waitFor(() => received.includes(2), { timeoutMs: 5000 });
+  await ps.flush();
+  await sleep(300);
+
+  assert.deepEqual(received, [1, 2]);
 });
 
 test('subscribeWithReplay cleans up paused subscription when setup fails', async () => {

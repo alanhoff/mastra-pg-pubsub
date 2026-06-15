@@ -66,6 +66,7 @@ test('retention does NOT delete events with pending deliveries', async () => {
     cleanupIntervalMs: 150,
     pollIntervalMs: 50,
     ackDeadlineMs: 30000, // Long deadline so deliveries stay pending
+    settlement: 'explicit',
   });
   pubsubs.push(ps);
 

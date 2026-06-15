@@ -2,6 +2,12 @@ import type { IMastraLogger } from '@mastra/core/logger';
 import type { Pool } from 'pg';
 
 /**
+ * Delivery settlement policy for callbacks that return without calling
+ * `ack()` or `nack()`.
+ */
+export type SettlementPolicy = 'mastra-compatible' | 'explicit' | 'callback-success';
+
+/**
  * Configuration for {@link PostgresPubSub}.
  *
  * Provide exactly one of {@link PostgresPubSubConfig.connectionString} or
@@ -81,6 +87,14 @@ export interface PostgresPubSubConfig {
    */
   deadLetter?: boolean;
   /**
+   * Callback settlement policy. Defaults to `mastra-compatible`, which
+   * auto-acks successful private/fan-out callbacks after they resolve while
+   * keeping group subscribers explicit by default. Use `explicit` to preserve
+   * strict ack/nack-only settlement everywhere, or `callback-success` to
+   * auto-ack successful callbacks for both private and group subscriptions.
+   */
+  settlement?: SettlementPolicy;
+  /**
    * Optional logger with the same shape accepted by `new Mastra({ logger })`.
    * When omitted, PubSub resolves the current Mastra span and uses its
    * observability logger. Pass `false` to force silence.
@@ -103,5 +117,6 @@ export interface ResolvedConfig {
   staleSubscriptionMs: number;
   listen: boolean;
   deadLetter: boolean;
+  settlement: SettlementPolicy;
   logger: IMastraLogger | false | undefined;
 }

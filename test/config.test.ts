@@ -307,3 +307,28 @@ test('numeric options accept documented zero and Infinity sentinels', () => {
   pubsubs.push(ps);
   assert.ok(ps);
 });
+
+test('settlement option accepts documented policies and rejects unknown values', () => {
+  for (const settlement of ['mastra-compatible', 'explicit', 'callback-success'] as const) {
+    assert.doesNotThrow(() => {
+      const ps = new PostgresPubSub({
+        connectionString: DATABASE_URL,
+        schema: uniqueSchema(),
+        cleanupIntervalMs: 0,
+        settlement,
+      });
+      pubsubs.push(ps);
+    }, `expected ${settlement} to be accepted`);
+  }
+
+  assert.throws(
+    () =>
+      new PostgresPubSub({
+        connectionString: DATABASE_URL,
+        schema: uniqueSchema(),
+        cleanupIntervalMs: 0,
+        settlement: 'auto-magical' as never,
+      }),
+    /settlement/,
+  );
+});

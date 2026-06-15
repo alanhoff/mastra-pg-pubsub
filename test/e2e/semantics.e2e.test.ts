@@ -16,6 +16,7 @@ test('at-least-once redelivery preserves event identity for idempotent consumers
     ackDeadlineMs: 150,
     pollIntervalMs: 25,
     maxDeliveryAttempts: Number.POSITIVE_INFINITY,
+    settlement: 'explicit',
   });
   pubsubs.push(ps);
 

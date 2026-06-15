@@ -22,6 +22,8 @@ interface ClaimedRow {
   delivery_attempt: number;
 }
 
+type SettlementKind = 'ack' | 'nack';
+
 /**
  * Round-robin set of local callbacks bound to one (topic, subscription) pair.
  * Group subscriptions round-robin a claimed event across local members;
@@ -95,6 +97,7 @@ export class ConsumeLoop {
       topic: this.#topic,
       subscriptionId: this.#subscriptionId,
       subscriptionKind: this.#isGroup ? 'group' : 'private',
+      settlementPolicy: this.#config.settlement,
       ...extra,
     });
   }
@@ -272,47 +275,74 @@ export class ConsumeLoop {
       eventIndex: event.index,
       runId: event.runId,
       deliveryAttempt: event.deliveryAttempt,
+      'delivery.settlement_policy': this.#config.settlement,
     });
     const span = startObservabilitySpan('pg_pubsub.delivery', deliveryContext);
 
     this.#inFlight++;
-    let settled = false;
-    const ack = async (): Promise<void> => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      await this.#ack(row.seq);
-      const context = this.#baseAttributes({
+    let settlementRequested = false;
+    let settlementSucceeded = false;
+    let settlementFailed = false;
+    let settlementKind: SettlementKind | undefined;
+    const settlementContext = (kind: SettlementKind) =>
+      this.#baseAttributes({
         eventId: event.id,
         eventType: event.type,
         eventIndex: event.index,
         runId: event.runId,
         deliveryAttempt: event.deliveryAttempt,
-        settlement: 'ack',
+        settlement: kind,
+        nackDelayMs: kind === 'nack' ? this.#config.nackDelayMs : undefined,
       });
-      logDebug(this.#config.logger, 'delivery acked', context);
-      observeEvent('pg_pubsub.delivery.acked', context);
-      span.setAttribute('delivery.settlement', 'ack');
+    const settle = async (kind: SettlementKind): Promise<void> => {
+      if (settlementRequested) {
+        return;
+      }
+      settlementRequested = true;
+      settlementKind = kind;
+      if (kind === 'ack') {
+        await this.#ack(row.seq);
+      } else {
+        await this.#nack(row.seq);
+      }
+      settlementSucceeded = true;
+      const context = settlementContext(kind);
+      logDebug(this.#config.logger, `delivery ${kind}ed`, context);
+      observeEvent(`pg_pubsub.delivery.${kind}ed`, context);
+      span.setAttribute('delivery.settlement', kind);
     };
-    const nack = async (): Promise<void> => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      await this.#nack(row.seq);
+    const ack = async (): Promise<void> => settle('ack');
+    const nack = async (): Promise<void> => settle('nack');
+
+    const markPending = (reason: string): void => {
       const context = this.#baseAttributes({
         eventId: event.id,
         eventType: event.type,
         eventIndex: event.index,
         runId: event.runId,
         deliveryAttempt: event.deliveryAttempt,
-        settlement: 'nack',
-        nackDelayMs: this.#config.nackDelayMs,
+        settlement: 'pending',
+        settlementReason: reason,
       });
-      logDebug(this.#config.logger, 'delivery nacked', context);
-      observeEvent('pg_pubsub.delivery.nacked', context);
-      span.setAttribute('delivery.settlement', 'nack');
+      logDebug(this.#config.logger, 'delivery left pending', context);
+      observeEvent('pg_pubsub.delivery.pending', context);
+      span.setAttribute('delivery.settlement', 'pending');
+      span.setAttribute('delivery.settlement_reason', reason);
+    };
+    const autoSettle = async (kind: SettlementKind, action: () => Promise<void>): Promise<void> => {
+      span.setAttribute('delivery.auto_settlement', kind);
+      try {
+        await action();
+      } catch (error) {
+        settlementFailed = true;
+        logError(
+          this.#config.logger,
+          `automatic delivery ${kind} failed`,
+          settlementContext(kind),
+          error,
+        );
+        span.recordError(error);
+      }
     };
 
     let callbackFailed = false;
@@ -323,14 +353,54 @@ export class ConsumeLoop {
       callbackFailed = true;
       logError(this.#config.logger, 'subscriber callback threw', deliveryContext, error);
       span.recordError(error);
+    }
+
+    if (!callbackFailed && !settlementRequested) {
+      if (this.#shouldAutoAckSuccessfulCallback()) {
+        await autoSettle('ack', ack);
+      } else {
+        markPending('explicit-settlement-required');
+      }
+    } else if (callbackFailed && !settlementRequested) {
+      if (this.#shouldNackFailedCallback()) {
+        await autoSettle('nack', nack);
+      } else {
+        markPending('callback-failed-explicit-settlement');
+      }
+    }
+
+    try {
+      if (settlementKind && !settlementSucceeded) {
+        settlementFailed = true;
+      }
     } finally {
       this.#inFlight--;
-      span.setAttribute('delivery.settled', settled);
+      span.setAttribute('delivery.settlement_requested', settlementRequested);
+      span.setAttribute('delivery.settled', settlementSucceeded);
+      span.setAttribute('delivery.settlement_failed', settlementFailed);
       span.end(
-        callbackFailed ? { code: 'error', message: 'subscriber callback threw' } : undefined,
+        callbackFailed
+          ? { code: 'error', message: 'subscriber callback threw' }
+          : settlementFailed
+            ? { code: 'error', message: 'delivery settlement failed' }
+            : undefined,
       );
       this.#markIdle();
     }
+  }
+
+  #shouldAutoAckSuccessfulCallback(): boolean {
+    if (this.#config.settlement === 'callback-success') {
+      return true;
+    }
+    if (this.#config.settlement === 'explicit') {
+      return false;
+    }
+    return !this.#isGroup;
+  }
+
+  #shouldNackFailedCallback(): boolean {
+    return this.#config.settlement !== 'explicit';
   }
 
   #nextCallback(): EventCallback | undefined {

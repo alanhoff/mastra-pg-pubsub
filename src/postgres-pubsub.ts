@@ -15,9 +15,14 @@ import {
 } from './observability.ts';
 import { runMigration } from './schema.ts';
 import { assertValidSchema, notifyChannel, quoteIdentifier } from './sql.ts';
-import type { PostgresPubSubConfig, ResolvedConfig } from './types.ts';
+import type { PostgresPubSubConfig, ResolvedConfig, SettlementPolicy } from './types.ts';
 
 const DEFAULT_SCHEMA = 'pg_pubsub';
+const SETTLEMENT_POLICIES = [
+  'mastra-compatible',
+  'explicit',
+  'callback-success',
+] as const satisfies readonly SettlementPolicy[];
 
 interface Subscription {
   readonly id: string;
@@ -95,6 +100,16 @@ function maxDeliveryAttemptsOption(
   return resolved;
 }
 
+function settlementOption(value: PostgresPubSubConfig['settlement']): SettlementPolicy {
+  const resolved = value ?? 'mastra-compatible';
+  if (!SETTLEMENT_POLICIES.includes(resolved)) {
+    throw new Error(
+      `settlement must be one of: ${SETTLEMENT_POLICIES.map((policy) => `"${policy}"`).join(', ')}`,
+    );
+  }
+  return resolved;
+}
+
 function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
   const logger = config.logger;
   const schema = config.schema ?? DEFAULT_SCHEMA;
@@ -117,6 +132,7 @@ function resolveConfig(config: PostgresPubSubConfig): ResolvedConfig {
     ),
     listen: config.listen ?? true,
     deadLetter: config.deadLetter ?? false,
+    settlement: settlementOption(config.settlement),
     logger,
   };
 }
@@ -178,6 +194,7 @@ export class PostgresPubSub extends PubSub {
       schema: this.#config.schema,
       listen: this.#config.listen,
       deadLetter: this.#config.deadLetter,
+      settlementPolicy: this.#config.settlement,
       ownsPool: this.#ownsPool,
       instanceId: this.#instanceId,
       channel: this.#channel,

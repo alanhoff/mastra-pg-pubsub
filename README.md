@@ -10,7 +10,7 @@ PostgreSQL-backed [`PubSub`](https://mastra.ai/reference/pubsub/base) for Mastra
 
 Use this when you want Mastra agent/workflow events to survive process restarts and coordinate across multiple Node processes without adding Redis, NATS, or a cloud queue.
 
-- **At-least-once delivery** with ack/nack and visibility timeouts.
+- **At-least-once delivery** with Mastra-compatible callback settlement, ack/nack, and visibility timeouts.
 - **Consumer groups** for competing workers (`subscribe(..., { group })`).
 - **Fan-out** for groupless subscribers.
 - **Replay** via `getHistory`, `subscribeWithReplay`, and `subscribeFromOffset`.
@@ -85,16 +85,16 @@ await pubsub.publish('agent.stream.run-123', {
 ```ts
 const history = await pubsub.getHistory('agent.stream.run-123', 10);
 
-await pubsub.subscribeWithReplay('agent.stream.run-123', (event, ack) => {
-  ack?.();
+await pubsub.subscribeWithReplay('agent.stream.run-123', (event) => {
+  console.log(event.index, event.type);
 });
 
-await pubsub.subscribeFromOffset('agent.stream.run-123', 42, (event, ack) => {
-  ack?.();
+await pubsub.subscribeFromOffset('agent.stream.run-123', 42, (event) => {
+  console.log(event.index, event.type);
 });
 ```
 
-Replay registers the live subscription first, then replays history, deduping the boundary by event `index` so no event is missed or delivered twice at the transition.
+Replay registers the live subscription first, then replays history, deduping the boundary by event `index` so no event is missed or delivered twice at the transition. Historical replay rows are settled during replay setup; live events use the configured settlement policy.
 
 ## Configuration
 
@@ -107,7 +107,7 @@ Provide exactly one of `connectionString` or `pool`.
 | `schema` | `pg_pubsub` | Schema for all tables. Must match `^[a-z_][a-z0-9_]*$`. Other custom names that start with `pg_` are rejected. |
 | `pollIntervalMs` | `1000` | Positive safe integer backstop polling interval and redelivery detection bound. |
 | `ackDeadlineMs` | `30000` | Positive safe integer visibility timeout before unacked deliveries can be reclaimed. |
-| `nackDelayMs` | `0` | Non-negative safe integer delay before a nacked delivery becomes visible again. |
+| `nackDelayMs` | `0` | Non-negative safe integer delay before a nacked delivery becomes visible again. Use a non-zero value to back off retries from auto-nacked callback failures. |
 | `maxDeliveryAttempts` | `5` | Positive safe integer attempts before drop/dead-letter. `Infinity` disables the cap; `0` is treated as `Infinity`. |
 | `batchSize` | `32` | Positive safe integer deliveries claimed per consume-loop tick. |
 | `maxEventsPerTopic` | `10000` | Non-negative safe integer retention cap per topic. `0` keeps everything. |
@@ -115,6 +115,7 @@ Provide exactly one of `connectionString` or `pool`.
 | `staleSubscriptionMs` | `300000` | Positive safe integer age before stale private subscriptions are pruned. |
 | `listen` | `true` | Enable `LISTEN/NOTIFY` wakeups. `false` uses polling only. |
 | `deadLetter` | `false` | Copy exhausted events to `dead_events`. |
+| `settlement` | `mastra-compatible` | Callback settlement policy: successful private/fan-out callbacks auto-ack after they resolve; group subscribers remain explicit. Use `explicit` for ack/nack-only settlement everywhere or `callback-success` to auto-ack successful group callbacks too. |
 | `logger` | current span logger | Same logger shape accepted by `new Mastra({ logger })`. Pass `false` to force silence. |
 
 The adapter always runs its idempotent migration during first database use. For production, run `await pubsub.migrate()` during deploy with the same package version to fail fast, and pre-create `pg_pubsub` with an admin/migration role when using the default schema. Runtime roles still need `USAGE, CREATE` on the adapter schema so `CREATE TABLE/INDEX IF NOT EXISTS` can run, plus DML privileges on adapter tables/sequences and `LISTEN/NOTIFY` access. Use `schema` when your database policy requires an ordinary application schema name.
@@ -138,6 +139,14 @@ When the last local subscriber is removed, the adapter stops idle resources: con
 
 `flush()` resolves when all in-flight publishes and deliveries for this adapter's active subscription ids settle. For private subscribers those ids are local to the process. For consumer groups the subscription id is shared by every process in the group, so `flush()` is intentionally a group-wide drain check and can wait on work claimed by another group member. Callback errors are logged, never thrown. If matching deliveries remain unsettled after the bounded drain window, `flush()` rejects so callers do not mistake stuck work for a clean drain.
 
+## Settlement Policy
+
+The default `settlement: 'mastra-compatible'` protects Mastra's event-only callbacks from duplicate loops: if a private/fan-out callback returns successfully without calling `ack()` or `nack()`, the adapter auto-acks the delivery after the returned promise resolves. Consumer-group callbacks remain explicit by default because groups are usually worker queues where the handler should decide when work is durable.
+
+Callback failures are never auto-acked. With `mastra-compatible` and `callback-success`, an unsettled failing callback is auto-nacked so it can retry according to `nackDelayMs`; with `explicit`, it stays pending until `ackDeadlineMs` makes it visible again. Because `nackDelayMs` defaults to `0`, callbacks that can fail repeatedly on external dependencies should set a non-zero retry delay and usually pair it with `maxDeliveryAttempts` plus `deadLetter`. Manual `ack()` or `nack()` always wins over automatic settlement.
+
+Use `settlement: 'explicit'` for strict ack/nack-only behavior, especially when a callback starts fire-and-forget work that can outlive the returned promise. Prefer awaiting durable side effects before returning, or keep explicit settlement and call `ack()` only after the side effect is safe.
+
 ## Observability
 
 The adapter emits payload-safe logs and Mastra observability spans/events. If `logger` is provided, it is used directly. If `logger` is omitted, the adapter resolves the current Mastra span with `resolveCurrentSpan()` and uses `span.observabilityInstance.getLogger()`. Pass `logger: false` to silence PubSub logs.
@@ -157,7 +166,7 @@ Span and event names use the `pg_pubsub.*` prefix, including `pg_pubsub.lifecycl
 
 | Property | Guarantee |
 | --- | --- |
-| Delivery | At least once; `ack()` settles, missing ack redelivers after `ackDeadlineMs`. |
+| Delivery | At least once; settlement follows `settlement`, manual `ack()` settles, and pending deliveries redeliver after `ackDeadlineMs`. |
 | Ordering | Per-topic `index` order for normal delivery; retries can interleave with newer events. |
 | Groups | Each event is delivered to one member per group. |
 | Fan-out | Each groupless subscriber receives every event published after it subscribes. |

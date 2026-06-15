@@ -25,6 +25,7 @@ test('maxDeliveryAttempts caps redeliveries: event is dropped after max attempts
     maxDeliveryAttempts,
     ackDeadlineMs: 200,
     pollIntervalMs: 50,
+    settlement: 'explicit',
   });
   pubsubs.push(ps);
 
@@ -58,6 +59,7 @@ test('with deadLetter:true, exhausted event lands in dead_events table', async (
     ackDeadlineMs: 200,
     pollIntervalMs: 50,
     deadLetter: true,
+    settlement: 'explicit',
   });
   pubsubs.push(ps);
 
@@ -106,6 +108,7 @@ test('maxDeliveryAttempts=0 logs a warn and behaves as unbounded', async () => {
     maxDeliveryAttempts: 0,
     ackDeadlineMs: 100,
     pollIntervalMs: 50,
+    settlement: 'explicit',
     logger: makeTestLogger({
       warn: (msg: string) => {
         warnings.push(msg);
